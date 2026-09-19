@@ -35,7 +35,7 @@ type Agent struct {
 	cmd                  string   // CLI binary name, default "opencode"
 	cliExtraArgs         []string // extra args from cmd after the binary name
 	configEnv            []string // env vars from [projects.agent.options.env]
-	agentName            string // passed as --agent to opencode (for plugin-defined agents)
+	agentName            string   // passed as --agent to opencode (for plugin-defined agents)
 	providers            []core.ProviderConfig
 	activeIdx            int
 	sessionEnv           []string
@@ -552,6 +552,106 @@ func (a *Agent) GlobalMemoryFile() string {
 		return ""
 	}
 	return filepath.Join(homeDir, ".opencode", "OPENCODE.md")
+}
+
+// -- SkillProvider --
+
+// SkillDirs returns the directories OpenCode searches for agent skills:
+// project-local <.opencode|.claude|.agents>/skills from the working directory
+// up to the repository root, plus the global OpenCode/Claude/agents locations.
+// See https://opencode.ai/docs/skills/.
+func (a *Agent) SkillDirs() []string {
+	a.mu.RLock()
+	workDir := a.workDir
+	a.mu.RUnlock()
+	absDir, err := filepath.Abs(workDir)
+	if err != nil {
+		absDir = workDir
+	}
+	return opencodeSkillDirs(absDir)
+}
+
+func opencodeSkillDirs(workDir string) []string {
+	homeDir, _ := os.UserHomeDir()
+	projectDirs := walkUpOpencodeProjectSkillDirs(workDir, homeDir)
+	userDirs := make([]string, 0, 3)
+	if homeDir != "" {
+		userDirs = append(userDirs,
+			filepath.Join(homeDir, ".config", "opencode", "skills"),
+			// OpenCode shares the Claude- and agents-format SKILL.md layouts.
+			filepath.Join(homeDir, ".claude", "skills"),
+			filepath.Join(homeDir, ".agents", "skills"),
+		)
+	}
+	return uniqueOpencodeSkillDirs(append(projectDirs, userDirs...))
+}
+
+func walkUpOpencodeProjectSkillDirs(workDir, homeDir string) []string {
+	current := filepath.Clean(workDir)
+	homeDir = filepath.Clean(homeDir)
+	stopAt := findOpencodeProjectRoot(current)
+
+	var dirs []string
+	for {
+		if homeDir != "" && sameOpencodePath(current, homeDir) {
+			break
+		}
+		dirs = append(dirs,
+			filepath.Join(current, ".opencode", "skills"),
+			// Keep project-local Claude- and agents-format skills portable.
+			filepath.Join(current, ".claude", "skills"),
+			filepath.Join(current, ".agents", "skills"),
+		)
+		if stopAt != "" && sameOpencodePath(current, stopAt) {
+			break
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+	return uniqueOpencodeSkillDirs(dirs)
+}
+
+func findOpencodeProjectRoot(start string) string {
+	current := filepath.Clean(start)
+	for {
+		for _, marker := range []string{".git", ".jj"} {
+			if _, err := os.Stat(filepath.Join(current, marker)); err == nil {
+				return current
+			}
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return ""
+		}
+		current = parent
+	}
+}
+
+func sameOpencodePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func uniqueOpencodeSkillDirs(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		clean := filepath.Clean(path)
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		out = append(out, clean)
+	}
+	return out
 }
 
 // -- ProviderSwitcher --
