@@ -69,6 +69,35 @@ func TestManagementSessions_MultiWorkspaceAggregatesAndQualifiesIDs(t *testing.T
 	}
 }
 
+func TestManagementSessions_LoadsPersistedWorkspaceStores(t *testing.T) {
+	dir := t.TempDir()
+	base := NewSessionManager(filepath.Join(dir, "proj.json"))
+	e := &Engine{sessions: base, multiWorkspace: true, name: "proj"}
+
+	// A workspace store exists on disk but is not live in this process (the
+	// workspace pool is empty right after a restart).
+	wsPath := filepath.Join(dir, "proj_ws_deadbeef.json")
+	ws := NewSessionManager(wsPath)
+	ws.GetOrCreateActive("telegram:9:9")
+	ws.Save()
+
+	if got := e.managementSessionCount(); got != 1 {
+		t.Fatalf("managementSessionCount() = %d, want 1 (persisted workspace session)", got)
+	}
+
+	qualified := filepath.Base(wsPath) + managementSessionWorkspaceSep + "s1"
+	ms, ok := e.findManagementSession(qualified)
+	if !ok || ms.session.ID != "s1" {
+		t.Fatalf("findManagementSession(%q) = %+v, ok=%v", qualified, ms, ok)
+	}
+
+	// Empty workspace stores are ignored.
+	NewSessionManager(filepath.Join(dir, "proj_ws_empty.json")).Save()
+	if got := e.managementSessionCount(); got != 1 {
+		t.Fatalf("managementSessionCount() = %d, want 1 after empty store", got)
+	}
+}
+
 func TestFindManagementSession_UnknownWorkspaceFallsBack(t *testing.T) {
 	dir := t.TempDir()
 	base := NewSessionManager(filepath.Join(dir, "base.json"))

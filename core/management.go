@@ -986,7 +986,7 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 					}
 				}
 				info := map[string]any{
-					"id":            managementSessionID(s, mm.workspace),
+					"id":            managementSessionID(s, mm.qualifier),
 					"name":          s.Name,
 					"session_key":   idToKey[s.ID],
 					"agent_type":    s.AgentType,
@@ -1096,7 +1096,7 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 
 		s.mu.Lock()
 		data := map[string]any{
-			"id":               managementSessionID(s, ms.workspace),
+			"id":               managementSessionID(s, ms.qualifier),
 			"name":             s.Name,
 			"session_key":      sessionKey,
 			"agent_session_id": s.AgentSessionID,
