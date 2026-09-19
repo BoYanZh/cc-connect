@@ -592,10 +592,7 @@ func walkUpOpencodeProjectSkillDirs(workDir, homeDir string) []string {
 	stopAt := findOpencodeProjectRoot(current)
 
 	var dirs []string
-	for {
-		if homeDir != "" && sameOpencodePath(current, homeDir) {
-			break
-		}
+	for current != "" && (homeDir == "" || !sameOpencodePath(current, homeDir)) {
 		dirs = append(dirs,
 			filepath.Join(current, ".opencode", "skills"),
 			// Keep project-local Claude- and agents-format skills portable.
