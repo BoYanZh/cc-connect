@@ -310,12 +310,12 @@ func TestAttach_ConversationIsolationViaSessionManager(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartSession conv-A: %v", err)
 	}
-	defer sessA.Close()
+	defer func() { _ = sessA.Close() }()
 	sessB, err := a.StartSession(ctx, reloaded.GetOrCreateActive("conv-B").GetAgentSessionID())
 	if err != nil {
 		t.Fatalf("StartSession conv-B: %v", err)
 	}
-	defer sessB.Close()
+	defer func() { _ = sessB.Close() }()
 
 	if sessA.CurrentSessionID() != "ses_agent_A" {
 		t.Fatalf("conv-A agent session = %q, want ses_agent_A", sessA.CurrentSessionID())
