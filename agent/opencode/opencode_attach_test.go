@@ -1,9 +1,13 @@
 package opencode
 
 import (
+	"context"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/chenhg5/cc-connect/core"
 )
 
 // TestBuildRunArgs_StandaloneHasNoAttach pins the pre-attach command shape:
@@ -103,7 +107,7 @@ func TestBuildRunArgs_WorkDirPreservedInBothModes(t *testing.T) {
 }
 
 // TestNormalizeServerURL covers config parsing: absent/empty stays
-// standalone, whitespace is trimmed, non-http(s) fails fast.
+// standalone, whitespace is trimmed, and malformed values fail fast.
 func TestNormalizeServerURL(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -114,13 +118,22 @@ func TestNormalizeServerURL(t *testing.T) {
 		{"absent", nil, "", false},
 		{"empty", "", "", false},
 		{"blank", "   ", "", false},
-		{"non-string", 42, "", false},
+		{"non-string-int", 42, "", true},
+		{"non-string-bool", true, "", true},
 		{"http", "http://127.0.0.1:4096", "http://127.0.0.1:4096", false},
 		{"https", "https://opencode.internal:4096", "https://opencode.internal:4096", false},
+		{"uppercase-scheme", "HTTP://127.0.0.1:4096", "HTTP://127.0.0.1:4096", false},
 		{"trims-spaces", "  http://127.0.0.1:4096  ", "http://127.0.0.1:4096", false},
+		{"with-path", "http://127.0.0.1:4096/some/path", "http://127.0.0.1:4096/some/path", false},
 		{"bare-host", "127.0.0.1:4096", "", true},
+		{"missing-host", "http://", "", true},
+		{"missing-host-slashes", "http:///path", "", true},
 		{"wrong-scheme", "ws://127.0.0.1:4096", "", true},
+		{"ftp-scheme", "ftp://127.0.0.1:4096", "", true},
 		{"garbage", "not a url", "", true},
+		{"userinfo", "http://user:s3cret@127.0.0.1:4096", "", true},
+		{"userinfo-no-password", "http://user@127.0.0.1:4096", "", true},
+		{"userinfo-wrong-scheme", "ftp://user:pw@127.0.0.1:4096", "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -138,18 +151,49 @@ func TestNormalizeServerURL(t *testing.T) {
 	}
 }
 
-// TestSanitizeServerURLForLog ensures logs never expose credentials even if
-// userinfo is embedded in a misconfigured URL.
+// TestNormalizeServerURL_NeverEchoesSecrets is a regression test: rejection
+// errors for secret-bearing URLs must not echo the credential back, since
+// errors can surface on messaging platforms.
+func TestNormalizeServerURL_NeverEchoesSecrets(t *testing.T) {
+	secrets := []any{
+		"http://admin:s3cret-pw@127.0.0.1:4096",
+		"http://admin:s3cret-pw@127.0.0.1:4096/?token=abc#frag",
+		"ftp://admin:s3cret-pw@127.0.0.1:4096",
+	}
+	for _, raw := range secrets {
+		_, err := normalizeServerURL(raw)
+		if err == nil {
+			t.Fatalf("normalizeServerURL(%v) err = nil, want rejection", raw)
+		}
+		if strings.Contains(err.Error(), "s3cret-pw") || strings.Contains(err.Error(), "admin:") {
+			t.Fatalf("rejection error leaks credentials: %q", err.Error())
+		}
+	}
+}
+
+// TestSanitizeServerURLForLog ensures logs never expose credentials, query
+// secrets, or fragments — even for misconfigured URLs. Unparseable values
+// become a fixed placeholder instead of being echoed.
 func TestSanitizeServerURLForLog(t *testing.T) {
 	if got := sanitizeServerURLForLog("http://127.0.0.1:4096"); got != "http://127.0.0.1:4096" {
 		t.Fatalf("plain URL rewritten: %q", got)
 	}
 	got := sanitizeServerURLForLog("http://user:s3cret@127.0.0.1:4096")
-	if strings.Contains(got, "s3cret") || strings.Contains(got, "user:") {
+	if strings.Contains(got, "s3cret") || strings.Contains(got, "user") {
 		t.Fatalf("credentials leaked in sanitized URL: %q", got)
 	}
 	if !strings.Contains(got, "127.0.0.1:4096") {
 		t.Fatalf("host lost in sanitized URL: %q", got)
+	}
+	got = sanitizeServerURLForLog("http://127.0.0.1:4096/?token=s3cret#frag")
+	if strings.Contains(got, "s3cret") || strings.Contains(got, "frag") {
+		t.Fatalf("query/fragment leaked in sanitized URL: %q", got)
+	}
+	if got := sanitizeServerURLForLog("://bad-url"); got != "[invalid server_url]" {
+		t.Fatalf("unparseable URL = %q, want placeholder", got)
+	}
+	if got := sanitizeServerURLForLog("not a url"); got != "[invalid server_url]" {
+		t.Fatalf("schemaless value = %q, want placeholder", got)
 	}
 }
 
@@ -220,5 +264,66 @@ func TestWorkspaceAgentOptions_PreservesServerURL(t *testing.T) {
 	plain := (&Agent{mode: "default"}).WorkspaceAgentOptions()
 	if _, ok := plain["server_url"]; ok {
 		t.Fatalf("standalone opts unexpectedly contain server_url: %v", plain)
+	}
+}
+
+// TestAttach_ConversationIsolationViaSessionManager is the integration-level
+// companion to TestAttach_ConversationIsolation: it drives the real
+// core.SessionManager conversation mapping (the same mapping the engine uses
+// for every frontend — GetOrCreateActive keyed by conversation identity,
+// AgentSessionID persisted per conversation and passed as the resume ID to
+// StartSession, mirroring engine.go) and verifies that two conversations
+// sharing one attached backend still resolve to distinct OpenCode sessions.
+// No platform code is involved; userKeys are opaque conversation identities.
+func TestAttach_ConversationIsolationViaSessionManager(t *testing.T) {
+	sm := core.NewSessionManager(filepath.Join(t.TempDir(), "state.json"))
+
+	convA := sm.GetOrCreateActive("conv-A")
+	convB := sm.GetOrCreateActive("conv-B")
+	if convA == convB {
+		t.Fatal("distinct conversations mapped to the same core session")
+	}
+
+	// Simulate one completed turn per conversation, as the engine does when
+	// it writes EventResult session IDs back via SetAgentSessionID.
+	convA.SetAgentSessionID("ses_agent_A", "opencode")
+	convB.SetAgentSessionID("ses_agent_B", "opencode")
+
+	// Same mapping must survive a manager reload (persistence path).
+	sm.Save()
+	reloaded := core.NewSessionManager(sm.StorePath())
+	if got := reloaded.GetOrCreateActive("conv-A").GetAgentSessionID(); got != "ses_agent_A" {
+		t.Fatalf("reloaded conv-A AgentSessionID = %q, want ses_agent_A", got)
+	}
+	if got := reloaded.GetOrCreateActive("conv-B").GetAgentSessionID(); got != "ses_agent_B" {
+		t.Fatalf("reloaded conv-B AgentSessionID = %q, want ses_agent_B", got)
+	}
+
+	serverURL, err := normalizeServerURL("http://127.0.0.1:4096")
+	if err != nil {
+		t.Fatalf("normalizeServerURL: %v", err)
+	}
+	a := &Agent{cmd: "opencode", workDir: t.TempDir(), serverURL: serverURL}
+
+	ctx := context.Background()
+	sessA, err := a.StartSession(ctx, reloaded.GetOrCreateActive("conv-A").GetAgentSessionID())
+	if err != nil {
+		t.Fatalf("StartSession conv-A: %v", err)
+	}
+	defer sessA.Close()
+	sessB, err := a.StartSession(ctx, reloaded.GetOrCreateActive("conv-B").GetAgentSessionID())
+	if err != nil {
+		t.Fatalf("StartSession conv-B: %v", err)
+	}
+	defer sessB.Close()
+
+	if sessA.CurrentSessionID() != "ses_agent_A" {
+		t.Fatalf("conv-A agent session = %q, want ses_agent_A", sessA.CurrentSessionID())
+	}
+	if sessB.CurrentSessionID() != "ses_agent_B" {
+		t.Fatalf("conv-B agent session = %q, want ses_agent_B", sessB.CurrentSessionID())
+	}
+	if sessA.CurrentSessionID() == sessB.CurrentSessionID() {
+		t.Fatal("backend reuse merged two conversations into one agent session")
 	}
 }

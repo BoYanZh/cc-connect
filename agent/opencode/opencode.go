@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -213,35 +214,60 @@ func normalizeMode(raw string) string {
 	}
 }
 
-// normalizeServerURL trims the configured server_url. Empty (absent) means
-// standalone mode. Only http(s) URLs are accepted; anything else is rejected
-// so a typo fails fast at startup instead of on the first message.
+// normalizeServerURL validates the configured server_url. Empty (absent)
+// means standalone mode. A non-empty value must be a string holding an
+// http(s) URL with a non-empty host. Embedded userinfo is rejected outright:
+// server auth belongs in OPENCODE_SERVER_USERNAME / OPENCODE_SERVER_PASSWORD
+// env vars, never in the URL. Anything invalid fails fast at startup instead
+// of on the first message. Error messages carry only the sanitized URL so a
+// secret-bearing value can never leak through them.
 func normalizeServerURL(raw any) (string, error) {
-	s, _ := raw.(string)
+	if raw == nil {
+		return "", nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("opencode: invalid server_url: must be a string, got %T", raw)
+	}
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return "", nil
 	}
-	lower := strings.ToLower(s)
-	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
-		return "", fmt.Errorf("opencode: invalid server_url %q: must start with http:// or https://", s)
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("opencode: invalid server_url: not a valid URL: %v", err)
+	}
+	if u.User != nil {
+		return "", fmt.Errorf("opencode: invalid server_url %q: embedded credentials are not allowed; use OPENCODE_SERVER_USERNAME / OPENCODE_SERVER_PASSWORD env vars instead", sanitizeServerURLForLog(s))
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return "", fmt.Errorf("opencode: invalid server_url %q: scheme must be http or https", sanitizeServerURLForLog(s))
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("opencode: invalid server_url %q: host must be non-empty", sanitizeServerURLForLog(s))
 	}
 	return s, nil
 }
 
-// sanitizeServerURLForLog strips any userinfo (credentials) from a server URL
-// so logs never expose secrets. The CLI takes auth via --username/--password
-// flags or OPENCODE_SERVER_* env vars, never embedded in the URL, but a
-// misconfigured URL must still be safe to log.
+// sanitizeServerURLForLog strips userinfo, query, and fragment from a server
+// URL so logs (and error messages) never expose secrets. Server auth is
+// env-based (OPENCODE_SERVER_*), so a well-formed URL carries nothing
+// sensitive — but a misconfigured one must still be safe to log. Values that
+// do not parse are replaced with a fixed placeholder rather than echoed.
 func sanitizeServerURLForLog(raw string) string {
-	at := strings.LastIndex(raw, "@")
-	if at < 0 {
-		return raw
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "[invalid server_url]"
 	}
-	if scheme := strings.Index(raw, "://"); scheme >= 0 && scheme+3 <= at {
-		return raw[:scheme+3] + "***@" + raw[at+1:]
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	if u.Scheme == "" || u.Host == "" {
+		return "[invalid server_url]"
 	}
-	return "***@" + raw[at+1:]
+	return u.String()
 }
 
 func (a *Agent) Name() string { return "opencode" }
