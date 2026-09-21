@@ -267,6 +267,98 @@ func TestWorkspaceAgentOptions_PreservesServerURL(t *testing.T) {
 	}
 }
 
+// TestHandleText_KeepsShortFragments is a regression test for silent
+// "(空响应)" on short replies: text fragments of any non-zero length must be
+// delivered (the engine joins them). Dropping e.g. single-character chunks
+// would turn a real "OK" answer into an empty turn.
+func TestHandleText_KeepsShortFragments(t *testing.T) {
+	s, err := newOpencodeSession(context.Background(), "opencode", nil, t.TempDir(), "", "default", "", "", core.ContinueSession, nil)
+	if err != nil {
+		t.Fatalf("newOpencodeSession: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	for _, chunk := range []string{"O", "K"} {
+		s.handleText(map[string]any{
+			"type": "text",
+			"part": map[string]any{"type": "text", "text": chunk, "sessionID": "ses_1"},
+		})
+	}
+	var got []string
+	for range 2 {
+		select {
+		case ev := <-s.Events():
+			if ev.Type != core.EventText {
+				t.Fatalf("event type = %v, want EventText", ev.Type)
+			}
+			got = append(got, ev.Content)
+		default:
+			t.Fatalf("missing EventText, got %q so far", got)
+		}
+	}
+	if strings.Join(got, "") != "OK" {
+		t.Fatalf("fragments = %q, want OK", got)
+	}
+}
+
+// TestCleanExitEvent_VacuousTurnReturnsError covers the intermittent
+// `run --attach` dropped-stream race (backend records parts the client never
+// prints, or vice versa; exit 0 either way): a clean exit with zero text and
+// zero tool events must surface an explicit error asking for a resend — never
+// a silent empty result. No automatic retry: the unseen turn may have
+// executed tools server-side.
+func TestCleanExitEvent_VacuousTurnReturnsError(t *testing.T) {
+	s, err := newOpencodeSession(context.Background(), "opencode", nil, t.TempDir(), "", "default", "", "http://127.0.0.1:4096", core.ContinueSession, nil)
+	if err != nil {
+		t.Fatalf("newOpencodeSession: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	evt := s.cleanExitEvent()
+	if evt == nil {
+		t.Fatal("cleanExitEvent = nil for vacuous turn, want explicit error")
+	}
+	if evt.Type != core.EventError {
+		t.Fatalf("event type = %v, want EventError", evt.Type)
+	}
+	if evt.Error == nil || !strings.Contains(evt.Error.Error(), "resend") {
+		t.Fatalf("error = %v, want resend guidance", evt.Error)
+	}
+}
+
+// TestCleanExitEvent_WithOutputProceedsNormally ensures ordinary turns
+// (text seen, or tools seen) still take the fallback EventResult path.
+func TestCleanExitEvent_WithOutputProceedsNormally(t *testing.T) {
+	newSess := func(t *testing.T) *opencodeSession {
+		s, err := newOpencodeSession(context.Background(), "opencode", nil, t.TempDir(), "", "default", "", "", core.ContinueSession, nil)
+		if err != nil {
+			t.Fatalf("newOpencodeSession: %v", err)
+		}
+		return s
+	}
+
+	s := newSess(t)
+	defer func() { _ = s.Close() }()
+	s.handleText(map[string]any{
+		"part": map[string]any{"type": "text", "text": "OK", "sessionID": "ses_1"},
+	})
+	<-s.Events() // drain
+	if evt := s.cleanExitEvent(); evt != nil {
+		t.Fatalf("cleanExitEvent = %v after text, want nil (normal result path)", evt)
+	}
+
+	s2 := newSess(t)
+	defer func() { _ = s2.Close() }()
+	s2.handleToolUse(map[string]any{
+		"part": map[string]any{"type": "tool_use", "tool": "bash",
+			"state": map[string]any{"status": "pending", "input": "ls"}},
+	})
+	<-s2.Events() // drain
+	if evt := s2.cleanExitEvent(); evt != nil {
+		t.Fatalf("cleanExitEvent = %v after tool use, want nil (normal result path)", evt)
+	}
+}
+
 // TestAttach_ConversationIsolationViaSessionManager is the integration-level
 // companion to TestAttach_ConversationIsolation: it drives the real
 // core.SessionManager conversation mapping (the same mapping the engine uses
