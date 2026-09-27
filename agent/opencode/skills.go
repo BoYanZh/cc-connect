@@ -150,6 +150,9 @@ func loadOpencodeSkillFile(skillPath, dirName string) (*core.Skill, error) {
 }
 
 func parseOpencodeFrontmatter(raw string) map[string]string {
+	// Intentionally minimal YAML: single-line "key: value" only.
+	// Folded/block scalars (e.g. "description: >") are not supported;
+	// OpenCode does not document them for SKILL.md frontmatter.
 	content := strings.TrimSpace(raw)
 	out := map[string]string{}
 	if !strings.HasPrefix(content, "---") {
@@ -323,6 +326,8 @@ func resolveOpencodeSkillPolicy(workDir, agentName string, env opencodeEnvFunc) 
 
 	disabledSet := false
 	disabled := false
+	// Loop order is intentional: sources are appended global → custom →
+	// project → inline, so later sources override earlier ones.
 	for _, src := range sources {
 		cfg, err := parseOpencodeConfig(src)
 		if err != nil {
@@ -348,6 +353,10 @@ func resolveOpencodeSkillPolicy(workDir, agentName string, env opencodeEnvFunc) 
 func findOpencodeConfigInWorkDir(workDir string) (string, error) {
 	current := filepath.Clean(workDir)
 	if current == "" || current == "." {
+		// If the cwd cannot be resolved either, the caller gets ("", nil)
+		// and policy resolution silently uses the global config only.
+		// That is intentional: a relative workDir without a resolvable
+		// cwd has no project scope to load.
 		if abs, err := filepath.Abs(workDir); err == nil {
 			current = abs
 		} else {

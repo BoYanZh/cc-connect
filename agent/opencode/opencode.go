@@ -664,6 +664,9 @@ func sameOpencodePath(a, b string) bool {
 }
 
 func uniqueOpencodeSkillDirs(paths []string) []string {
+	// filepath.Clean does not normalize case, so on Windows two paths
+	// differing only in case are both emitted. Same limitation as the
+	// claudecode adapter; kept for consistency.
 	seen := make(map[string]struct{}, len(paths))
 	out := make([]string, 0, len(paths))
 	for _, path := range paths {
