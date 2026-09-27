@@ -590,12 +590,14 @@ func (a *Agent) GlobalMemoryFile() string {
 func (a *Agent) SkillDirs() []string {
 	a.mu.RLock()
 	workDir := a.workDir
+	extraEnv := append([]string(nil), a.configEnv...)
+	extraEnv = append(extraEnv, a.sessionEnv...)
 	a.mu.RUnlock()
 	absDir, err := filepath.Abs(workDir)
 	if err != nil {
 		absDir = workDir
 	}
-	return opencodeSkillDirs(absDir)
+	return opencodeSkillDirsFiltered(absDir, opencodeEnvLookup(extraEnv))
 }
 
 func opencodeSkillDirs(workDir string) []string {
