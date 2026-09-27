@@ -28,6 +28,13 @@ type managementSession struct {
 // workspaces (each manager starts at "s1"). In multi-workspace mode the id is
 // qualified so it stays unique and can be resolved back to the owning manager
 // via findManagementSession.
+//
+// The qualifier is opaque and URL-safe (never a filesystem path): it is
+// derived from the workspace session store file, so the same workspace gets
+// the same qualifier whether its manager is live in this process or loaded
+// cold from disk after a restart. A raw workspace path must never be used as
+// a qualifier — it contains "/" which breaks URL routing and changes with
+// path normalization.
 const managementSessionWorkspaceSep = "::"
 
 func managementSessionID(session *Session, qualifier string) string {
@@ -35,6 +42,35 @@ func managementSessionID(session *Session, qualifier string) string {
 		return session.ID
 	}
 	return qualifier + managementSessionWorkspaceSep + session.ID
+}
+
+// managementQualifierForStore derives a stable, URL-safe, opaque qualifier
+// from a workspace session store path.
+//
+// Live managers and cold disk stores for the same workspace share the same
+// store file (<project>_ws_<8hex>.json where 8hex = hex(sha256(workspace)[:4]),
+// see getOrCreateWorkspaceAgent), so deriving from the store path keeps ids
+// stable across restarts and across the live/cold transition.
+func managementQualifierForStore(storePath string) string {
+	base := filepath.Base(storePath)
+	if idx := strings.LastIndex(base, "_ws_"); idx >= 0 {
+		rest := base[idx+len("_ws_"):]
+		hexPart := strings.TrimSuffix(rest, ".json")
+		if hexPart != "" {
+			isHex := true
+			for _, c := range hexPart {
+				if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+					isHex = false
+					break
+				}
+			}
+			if isHex {
+				return strings.ToLower(hexPart)
+			}
+		}
+		return strings.TrimSuffix(base, ".json")
+	}
+	return strings.TrimSuffix(base, ".json")
 }
 
 func sortedManagementKeys[V any](m map[string]V) []string {
@@ -62,13 +98,19 @@ func (e *Engine) managementSessionManagers() []managementSessionManager {
 		all := e.workspacePool.All()
 		for _, path := range sortedManagementKeys(all) {
 			ws := all[path]
-			if ws == nil || ws.sessions == nil || ws.sessions == e.sessions {
+			if ws == nil {
 				continue
 			}
-			live[ws.sessions.StorePath()] = managementSessionManager{
-				manager:   ws.sessions,
+			// Snapshot under ws.mu — the pool copy does not protect
+			// per-workspace fields and unlocked reads trip the race detector.
+			sm := ws.getSessions()
+			if sm == nil || sm == e.sessions {
+				continue
+			}
+			live[sm.StorePath()] = managementSessionManager{
+				manager:   sm,
 				workspace: path,
-				qualifier: path,
+				qualifier: managementQualifierForStore(sm.StorePath()),
 			}
 		}
 	}
@@ -86,7 +128,7 @@ func (e *Engine) managementSessionManagers() []managementSessionManager {
 				}
 				disk[path] = managementSessionManager{
 					manager:   sm,
-					qualifier: filepath.Base(path),
+					qualifier: managementQualifierForStore(path),
 				}
 			}
 		}
@@ -113,20 +155,60 @@ func (e *Engine) managementSessionCount() int {
 	return count
 }
 
+// managementLiveStatus reports whether sessionKey is live. In multi-workspace
+// mode the interactive state key is "<workspace>:<sessionKey>" (see
+// interactiveKeyForSessionKey), so a bare-key lookup alone always reports
+// live:false for workspace sessions. The workspace-aware candidate is checked
+// first, then the bare key, then a suffix scan for cold disk entries whose
+// workspace path is unknown in this process (mirrors workspaceFromLiveState).
+func managementLiveStatus(sessionKey, workspace string, activeKeys map[string]string) (live bool, platform string) {
+	if sessionKey == "" {
+		return false, ""
+	}
+	if workspace != "" {
+		if p, ok := activeKeys[workspace+":"+sessionKey]; ok {
+			return true, p
+		}
+	}
+	if p, ok := activeKeys[sessionKey]; ok {
+		return true, p
+	}
+	suffix := ":" + sessionKey
+	for k, p := range activeKeys {
+		if strings.HasSuffix(k, suffix) {
+			return true, p
+		}
+	}
+	return false, ""
+}
+
 // findManagementSession resolves a management session id to the session and the
-// manager that owns it. It accepts both a bare id (single-workspace, or a first
-// match while searching all managers) and the qualified id returned by
-// managementSessionID.
+// manager that owns it.
+//
+//   - A qualified id (<qualifier>::<sessionID>) resolves only against the
+//     manager carrying that qualifier. An unknown qualifier or an unknown id
+//     under a known qualifier returns not-found — it must never fall back to
+//     searching the bare id, otherwise a workspace request can silently
+//     resolve to a same-named base session and leak its history.
+//   - A bare id resolves only against the base manager. In multi-workspace
+//     mode workspace sessions require their qualified id; in single-workspace
+//     mode the base manager is the only manager anyway.
 func (e *Engine) findManagementSession(id string) (managementSession, bool) {
 	if id == "" {
 		return managementSession{}, false
 	}
 
 	managers := e.managementSessionManagers()
+	if len(managers) == 0 {
+		return managementSession{}, false
+	}
 
 	if idx := strings.LastIndex(id, managementSessionWorkspaceSep); idx >= 0 {
 		qualifier := id[:idx]
 		raw := id[idx+len(managementSessionWorkspaceSep):]
+		if qualifier == "" || raw == "" {
+			return managementSession{}, false
+		}
 		for _, mm := range managers {
 			if mm.qualifier != qualifier {
 				continue
@@ -136,14 +218,12 @@ func (e *Engine) findManagementSession(id string) (managementSession, bool) {
 			}
 			return managementSession{}, false
 		}
-		// Unknown qualifier: fall back to searching the bare id below.
-		id = raw
+		return managementSession{}, false
 	}
 
-	for _, mm := range managers {
-		if s := mm.manager.FindByID(id); s != nil {
-			return managementSession{session: s, manager: mm.manager, workspace: mm.workspace, qualifier: mm.qualifier}, true
-		}
+	if s := managers[0].manager.FindByID(id); s != nil {
+		mm := managers[0]
+		return managementSession{session: s, manager: mm.manager, workspace: mm.workspace, qualifier: mm.qualifier}, true
 	}
 	return managementSession{}, false
 }

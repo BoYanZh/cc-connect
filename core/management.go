@@ -1003,10 +1003,10 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 				}
 
 				sessionKey := idToKey[s.ID]
-				_, live := activeKeys[sessionKey]
+				live, livePlatform := managementLiveStatus(sessionKey, mm.workspace, activeKeys)
 				info["live"] = live
-				if p, ok := activeKeys[sessionKey]; ok {
-					info["platform"] = p
+				if livePlatform != "" {
+					info["platform"] = livePlatform
 				} else if len(sessionKey) > 0 {
 					parts := splitSessionKey(sessionKey)
 					if len(parts) > 0 {
@@ -1091,8 +1091,16 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 		sessionKey := idToKey[s.ID]
 
 		e.interactiveMu.Lock()
-		_, live := e.interactiveStates[sessionKey]
+		activeSnapshot := make(map[string]string, len(e.interactiveStates))
+		for key, state := range e.interactiveStates {
+			pName := ""
+			if state.platform != nil {
+				pName = state.platform.Name()
+			}
+			activeSnapshot[key] = pName
+		}
 		e.interactiveMu.Unlock()
+		live, livePlatform := managementLiveStatus(sessionKey, ms.workspace, activeSnapshot)
 
 		s.mu.Lock()
 		data := map[string]any{
@@ -1110,7 +1118,9 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 		}
 		s.mu.Unlock()
 
-		if len(sessionKey) > 0 {
+		if livePlatform != "" {
+			data["platform"] = livePlatform
+		} else if len(sessionKey) > 0 {
 			parts := splitSessionKey(sessionKey)
 			if len(parts) > 0 {
 				data["platform"] = parts[0]
