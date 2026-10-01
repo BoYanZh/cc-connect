@@ -664,7 +664,7 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 		return nil, fmt.Errorf("opencode: parse session list: %w", err)
 	}
 
-	msgCounts := querySessionMessageCounts()
+	msgCounts := querySessionMessageCounts(legacyOpencodeDBPath())
 
 	var sessions []core.AgentSessionInfo
 	for _, e := range entries {
@@ -680,9 +680,8 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 }
 
 // querySessionMessageCounts uses the sqlite3 CLI to read message counts from
-// OpenCode's local database. Returns an empty map on any failure.
-func querySessionMessageCounts() map[string]int {
-	dbPath := opencodeDBPath()
+// the given OpenCode database. Returns an empty map on any failure.
+func querySessionMessageCounts(dbPath string) map[string]int {
 	if dbPath == "" {
 		return nil
 	}
@@ -716,7 +715,10 @@ func querySessionMessageCounts() map[string]int {
 	return counts
 }
 
-func opencodeDBPath() string {
+// legacyOpencodeDBPath is the default OpenCode database location
+// (honoring XDG_DATA_HOME). Counts/titles must be read from the same file
+// the CLI uses; a mismatch surfaces as ghost sessions with 0 msgs in /list.
+func legacyOpencodeDBPath() string {
 	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
 		return filepath.Join(xdg, "opencode", "opencode.db")
 	}
@@ -728,11 +730,10 @@ func opencodeDBPath() string {
 }
 
 func (a *Agent) GetSessionTitle(sessionID string) string {
-	return querySessionTitle(sessionID)
+	return querySessionTitle(legacyOpencodeDBPath(), sessionID)
 }
 
-func querySessionTitle(sessionID string) string {
-	dbPath := opencodeDBPath()
+func querySessionTitle(dbPath, sessionID string) string {
 	if dbPath == "" {
 		return ""
 	}
