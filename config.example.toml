@@ -1943,7 +1943,14 @@ app_secret = "your-feishu-app-secret"
 # is verified for same-host deployments only (cc-connect and `opencode web` /
 # `opencode serve` on the same machine and user). Arbitrary remote-server
 # parity is not claimed.
+# The backend and cc-connect must also resolve to the SAME database file:
+# keep OPENCODE_DB / OPENCODE_DISABLE_CHANNEL_DB identical on both sides.
+# A mismatch shows up as ghost sessions with 0 msgs in /list. Counts/titles
+# always follow the CLI's real database (resolved via `opencode db path`).
 # attach 模式仅验证过本机同用户部署；远端服务器的数据一致性不在保证范围内.
+# 后端与 cc-connect 还须指向同一个库文件：两侧的 OPENCODE_DB /
+# OPENCODE_DISABLE_CHANNEL_DB 须保持一致，否则 /list 会出现 0 msgs 的幽灵
+# 会话；计数与标题以 CLI 实际所用库为准.
 # attach 模式仅复用后端 `--attach`，各会话的 session 与 work_dir 保持独立；
 # 后端需自行提前启动，认证走环境变量，失败时直接报错不静默回退。
 # 不配置 server_url 时为默认的 standalone 模式，行为与之前完全一致.

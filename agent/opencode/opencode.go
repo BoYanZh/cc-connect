@@ -744,7 +744,7 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 		return nil, fmt.Errorf("opencode: parse session list: %w", err)
 	}
 
-	msgCounts := querySessionMessageCounts()
+	msgCounts := querySessionMessageCounts(resolveOpencodeDBPath(cmd, workDir))
 
 	var sessions []core.AgentSessionInfo
 	for _, e := range entries {
@@ -760,9 +760,8 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 }
 
 // querySessionMessageCounts uses the sqlite3 CLI to read message counts from
-// OpenCode's local database. Returns an empty map on any failure.
-func querySessionMessageCounts() map[string]int {
-	dbPath := opencodeDBPath()
+// the given OpenCode database. Returns an empty map on any failure.
+func querySessionMessageCounts(dbPath string) map[string]int {
 	if dbPath == "" {
 		return nil
 	}
@@ -796,7 +795,40 @@ func querySessionMessageCounts() map[string]int {
 	return counts
 }
 
-func opencodeDBPath() string {
+// resolveOpencodeDBPath asks the driven OpenCode CLI for its real database
+// path (`opencode db path`) instead of assuming the default `opencode.db`.
+// The effective path depends on the CLI's environment (OPENCODE_DB,
+// OPENCODE_DISABLE_CHANNEL_DB, XDG_DATA_HOME); reading counts/titles from a
+// different file than the one the CLI uses surfaces as ghost sessions with
+// 0 msgs in /list. Falls back to the historical default when discovery
+// fails (e.g. older CLI without `db path`), so behavior is unchanged there.
+func resolveOpencodeDBPath(cmd, workDir string) string {
+	return resolveOpencodeDBPathWithRunner(cmd, workDir, runOpencodeDBPath)
+}
+
+func runOpencodeDBPath(cmd, workDir string) ([]byte, error) {
+	c := exec.Command(cmd, "db", "path")
+	c.Dir = workDir
+	return c.Output()
+}
+
+func resolveOpencodeDBPathWithRunner(cmd, workDir string, run func(cmd, workDir string) ([]byte, error)) string {
+	if out, err := run(cmd, workDir); err == nil {
+		if p := strings.TrimSpace(string(out)); p != "" {
+			if p != legacyOpencodeDBPath() {
+				slog.Info("opencode: CLI uses a non-default database; session counts/titles resolve against it", "db_path", p)
+			}
+			return p
+		}
+	} else {
+		slog.Debug("opencode: db path discovery failed, using default database", "err", err)
+	}
+	return legacyOpencodeDBPath()
+}
+
+// legacyOpencodeDBPath is the historical default database location, kept as
+// the fallback when `opencode db path` discovery is unavailable.
+func legacyOpencodeDBPath() string {
 	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
 		return filepath.Join(xdg, "opencode", "opencode.db")
 	}
@@ -808,11 +840,14 @@ func opencodeDBPath() string {
 }
 
 func (a *Agent) GetSessionTitle(sessionID string) string {
-	return querySessionTitle(sessionID)
+	a.mu.RLock()
+	cmd := a.cmd
+	workDir := a.workDir
+	a.mu.RUnlock()
+	return querySessionTitle(resolveOpencodeDBPath(cmd, workDir), sessionID)
 }
 
-func querySessionTitle(sessionID string) string {
-	dbPath := opencodeDBPath()
+func querySessionTitle(dbPath, sessionID string) string {
 	if dbPath == "" {
 		return ""
 	}
