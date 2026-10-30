@@ -530,12 +530,20 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 
 	// Never delete a session that lives in another project directory: with
 	// the global /list, an index can point at a foreign session, and the
-	// CLI delete takes only a session ID with no directory scoping. Look
-	// the directory up first; unknown sessions fall through to the CLI so
-	// its own error surfaces.
-	if dir, ok := querySessionDirectory(legacyOpencodeDBPath(), sessionID); ok && !core.SameAgentDir(dir, workDir) {
-		return fmt.Errorf("opencode: refuse to delete session %s from another directory (%s); switch to that project first", sessionID, dir)
+	// CLI delete takes only a session ID with no directory scoping.
+	dbPath := legacyOpencodeDBPath()
+	if dir, known := querySessionDirectory(dbPath, sessionID); known {
+		if !core.SameAgentDir(dir, workDir) {
+			return fmt.Errorf("opencode: refuse to delete session %s from another directory (%s); switch to that project first", sessionID, dir)
+		}
+	} else if hasSessionV2Table(dbPath) {
+		// The session is not in a modern database that should know about
+		// every session: refuse rather than letting the unscoped CLI
+		// delete resolve it.
+		return fmt.Errorf("opencode: refuse to delete unknown session %s (not found in the local database)", sessionID)
 	}
+	// Legacy database without a v2 table: fall through to the CLI so its
+	// own per-project scoping applies.
 
 	c := exec.Command(cmd, "session", "delete", sessionID)
 	c.Dir = workDir
@@ -906,6 +914,16 @@ func querySessionTitle(dbPath, sessionID string) string {
 		}
 	}
 	return ""
+}
+
+// hasSessionV2Table reports whether the v2 session table exists.
+func hasSessionV2Table(dbPath string) bool {
+	db, err := openOpencodeDB(dbPath)
+	if err != nil {
+		return false
+	}
+	defer closeQuiet(db, "db", dbPath)
+	return tableExists(db, "session_v2")
 }
 
 // querySessionDirectory returns the project directory recorded for a
