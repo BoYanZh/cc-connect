@@ -7800,7 +7800,7 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 		agentName := agent.Name()
 		activeSession := sessions.GetOrCreateActive(msg.SessionKey)
 		activeAgentID := activeSession.GetAgentSessionID()
-		workDir := e.commandWorkDir(agent, msg)
+		workDir := e.guardWorkDir(agent, msg.SessionKey)
 
 		var sb strings.Builder
 		if totalPages > 1 {
@@ -7883,12 +7883,12 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	// into it would make the agent read and edit files in that directory
 	// while the UI still shows the current one, so refuse with a pointer
 	// instead of silently crossing the project boundary.
-	if workDir := e.commandWorkDir(agent, msg); matched.Directory != "" && workDir != "" && !SameAgentDir(matched.Directory, workDir) {
+	if dir, foreign := foreignSessionDir(e.guardWorkDir(agent, msg.SessionKey), matched); foreign {
 		shortID := matched.ID
 		if len(shortID) > 12 {
 			shortID = shortID[:12]
 		}
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgSwitchForeignDirectory, shortID, matched.Directory))
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgForeignSessionDenied, shortID, dir))
 		return
 	}
 
@@ -7993,6 +7993,35 @@ func (e *Engine) commandWorkDir(agent Agent, msg *Message) string {
 		return normalizeWorkspacePath(cwd)
 	}
 	return ""
+}
+
+// guardWorkDir resolves the project directory that session listings,
+// switches and deletes are scoped to: the agent's own work dir first, then
+// the workspace recorded for the session key. Empty when unknown, in which
+// case guards stay permissive. A single notion of "current directory" is
+// used by every guard and every /list label so the views cannot disagree.
+func (e *Engine) guardWorkDir(agent Agent, sessionKey string) string {
+	if switcher, ok := agent.(WorkDirSwitcher); ok {
+		if wd := strings.TrimSpace(switcher.GetWorkDir()); wd != "" {
+			return normalizeWorkspacePath(wd)
+		}
+	}
+	if wd := e.sendWorkDirForSession(sessionKey); wd != "" {
+		return normalizeWorkspacePath(wd)
+	}
+	return ""
+}
+
+// foreignSessionDir returns the foreign directory and true when matched
+// lives in another project than workDir. Unknown directories never refuse.
+func foreignSessionDir(workDir string, matched *AgentSessionInfo) (string, bool) {
+	if matched == nil || matched.Directory == "" || workDir == "" {
+		return "", false
+	}
+	if SameAgentDir(matched.Directory, workDir) {
+		return "", false
+	}
+	return matched.Directory, true
 }
 
 func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDir string, contextLeft string) string {
@@ -9335,6 +9364,14 @@ func (e *Engine) cmdName(p Platform, msg *Message, args []string) {
 		agentSessions = e.applySessionFilter(agentSessions, sessions, msg.SessionKey)
 		if idx > len(agentSessions) {
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoSession), idx))
+			return
+		}
+		if dir, foreign := foreignSessionDir(e.guardWorkDir(agent, msg.SessionKey), &agentSessions[idx-1]); foreign {
+			shortID := agentSessions[idx-1].ID
+			if len(shortID) > 12 {
+				shortID = shortID[:12]
+			}
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgForeignSessionDenied, shortID, dir))
 			return
 		}
 		targetID = agentSessions[idx-1].ID
@@ -12885,7 +12922,9 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	}
 
 	if prefix == "act" {
-		e.executeCardAction(cmd, args, sessionKey)
+		if card := e.executeCardAction(cmd, args, sessionKey); card != nil {
+			return card
+		}
 	}
 
 	switch cmd {
@@ -13036,24 +13075,24 @@ func workspaceFromInteractiveKey(interactiveKey, sessionKey string) string {
 
 // executeCardAction performs the side-effect for act: prefixed actions
 // (e.g. switching model/mode/lang) before the card is re-rendered.
-func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
+func (e *Engine) executeCardAction(cmd, args, sessionKey string) *Card {
 	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 
 	switch cmd {
 	case "/model":
 		if args == "" {
-			return
+			return nil
 		}
 		agent, sessions := e.sessionContextForKey(sessionKey)
 		switcher, ok := agent.(ModelSwitcher)
 		if !ok {
-			return
+			return nil
 		}
 		fetchCtx, cancel := context.WithTimeout(e.ctx, 3*time.Second)
 		target, ok := parseModelSwitchArgs(strings.Fields(args))
 		if !ok {
 			cancel()
-			return
+			return nil
 		}
 		target = strings.TrimSpace(target)
 		if modelSwitchNeedsLookup(target) {
@@ -13076,12 +13115,12 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 
 	case "/reasoning":
 		if args == "" {
-			return
+			return nil
 		}
 		agent, sessions := e.sessionContextForKey(sessionKey)
 		switcher, ok := agent.(ReasoningEffortSwitcher)
 		if !ok {
-			return
+			return nil
 		}
 		efforts := switcher.AvailableReasoningEfforts()
 		target := strings.ToLower(strings.TrimSpace(args))
@@ -13096,23 +13135,23 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 				s.SetAgentSessionID("", "")
 				s.ClearHistory()
 				sessions.Save()
-				return
+				return nil
 			}
 		}
 
 	case "/mode":
 		if args == "" {
-			return
+			return nil
 		}
 		switcher, ok := e.agent.(ModeSwitcher)
 		if !ok {
-			return
+			return nil
 		}
 		newMode := strings.ToLower(args)
 		switcher.SetMode(newMode)
 		if e.applyLiveModeChange(sessionKey, switcher.GetMode()) {
 			e.cleanupInteractiveState(interactiveKey)
-			return
+			return nil
 		}
 		e.cleanupInteractiveState(interactiveKey)
 		// Mode change requires a new session to take effect
@@ -13123,7 +13162,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 
 	case "/lang":
 		if args == "" {
-			return
+			return nil
 		}
 		target := strings.ToLower(strings.TrimSpace(args))
 		var lang Language
@@ -13141,17 +13180,17 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		case "auto":
 			lang = LangAuto
 		default:
-			return
+			return nil
 		}
 		e.i18n.SetLang(lang)
 
 	case "/provider":
 		if args == "" {
-			return
+			return nil
 		}
 		switcher, ok := e.agent.(ProviderSwitcher)
 		if !ok {
-			return
+			return nil
 		}
 		provName := args
 		if provName == "clear" {
@@ -13172,12 +13211,12 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 
 	case "/provider/add":
 		if args == "" {
-			return
+			return nil
 		}
 		agentType := e.agent.Name()
 		presets, err := FetchProviderPresets()
 		if err != nil || presets == nil {
-			return
+			return nil
 		}
 		for _, preset := range presets.Providers {
 			if preset.Name != args {
@@ -13199,7 +13238,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 				pa.codexHTTPHeaders = ac.CodexConfig.HTTPHeaders
 			}
 			e.setPendingProviderAdd(sessionKey, pa)
-			return
+			return nil
 		}
 
 	case "/provider/add-other":
@@ -13223,17 +13262,28 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 
 	case "/switch":
 		if args == "" {
-			return
+			return nil
 		}
 		agent, sessions := e.sessionContextForKey(sessionKey)
 		agentSessions, err := agent.ListSessions(e.ctx)
 		if err != nil || len(agentSessions) == 0 {
-			return
+			return nil
 		}
 		agentSessions = e.applySessionFilter(agentSessions, sessions, sessionKey)
 		matched := e.matchSession(agentSessions, sessions, args)
 		if matched == nil {
-			return
+			return nil
+		}
+		if dir, foreign := foreignSessionDir(e.guardWorkDir(agent, sessionKey), matched); foreign {
+			shortID := matched.ID
+			if len(shortID) > 12 {
+				shortID = shortID[:12]
+			}
+			return e.simpleCard(
+				e.i18n.Tf(MsgCardTitleSessions, agent.Name(), len(agentSessions)),
+				"red",
+				e.i18n.Tf(MsgForeignSessionDenied, shortID, dir),
+			)
 		}
 		e.cleanupInteractiveState(interactiveKey)
 		// Same constraint as cmdSwitch: switching to a known agent session
@@ -13242,11 +13292,12 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		// zero messages right after a successful card switch. A fresh Session
 		// already has nil History, so leaving it alone is a no-op there.
 		sessions.SwitchToAgentSession(sessionKey, matched.ID, agent.Name(), matched.Summary)
+		return nil
 
 	case "/dir":
 		fields := strings.Fields(args)
 		if len(fields) == 0 {
-			return
+			return nil
 		}
 		agent, sessions := e.sessionContextForKey(sessionKey)
 		ik := e.interactiveKeyForSessionKey(sessionKey)
@@ -13254,7 +13305,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		switch fields[0] {
 		case "select":
 			if len(fields) < 2 {
-				return
+				return nil
 			}
 			applyArgs = []string{fields[1]}
 		case "reset":
@@ -13262,7 +13313,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		case "prev":
 			applyArgs = []string{"-"}
 		default:
-			return
+			return nil
 		}
 		errMsg, _ := e.dirApply(agent, sessions, ik, sessionKey, applyArgs)
 		if errMsg != "" {
@@ -13274,7 +13325,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 
 	case "/heartbeat":
 		if e.heartbeatScheduler == nil {
-			return
+			return nil
 		}
 		switch args {
 		case "pause", "stop":
@@ -13287,11 +13338,11 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 
 	case "/cron":
 		if e.cronScheduler == nil || args == "" {
-			return
+			return nil
 		}
 		subArgs := strings.Fields(args)
 		if len(subArgs) < 2 {
-			return
+			return nil
 		}
 		sub, id := subArgs[0], subArgs[1]
 		switch sub {
@@ -13313,11 +13364,11 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 
 	case "/timer":
 		if e.timerScheduler == nil || args == "" {
-			return
+			return nil
 		}
 		subArgs := strings.Fields(args)
 		if len(subArgs) < 2 {
-			return
+			return nil
 		}
 		sub, id := subArgs[0], subArgs[1]
 		switch sub {
@@ -13329,6 +13380,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 			e.timerScheduler.SetMute(id, false)
 		}
 	}
+	return nil
 }
 
 func (e *Engine) getOrCreateDeleteModeState(sessionKey string, p Platform, replyCtx any) *deleteModeState {
@@ -14011,10 +14063,7 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 	agentName := agent.Name()
 	activeSession := sessions.GetOrCreateActive(sessionKey)
 	activeAgentID := activeSession.GetAgentSessionID()
-	var workDir string
-	if switcher, ok := agent.(WorkDirSwitcher); ok {
-		workDir = switcher.GetWorkDir()
-	}
+	workDir := e.guardWorkDir(agent, sessionKey)
 
 	var titleStr string
 	if totalPages > 1 {

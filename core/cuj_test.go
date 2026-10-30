@@ -2900,3 +2900,64 @@ func TestCUJ_K1_SwitchRefusesForeignDirectory(t *testing.T) {
 		t.Fatalf("own switch failed, got %q", got)
 	}
 }
+
+// TestCUJ_K2_CardSwitchRefusesForeignDirectory pins the same guard on the
+// card path: tapping a foreign row must surface a refusal card instead of
+// switching. Driven through handleCardNav, the same entrypoint a platform
+// card tap uses.
+func TestCUJ_K2_CardSwitchRefusesForeignDirectory(t *testing.T) {
+	env := newCUJEnv(t)
+	env.agent.SetWorkDir("/work")
+	now := time.Now()
+	env.agent.mu.Lock()
+	env.agent.listSessions = []AgentSessionInfo{
+		{ID: "ses_foreign", Summary: "foreign work", Directory: "/other", MessageCount: 3, ModifiedAt: now},
+		{ID: "ses_own", Summary: "own work", Directory: "/work", MessageCount: 5, ModifiedAt: now.Add(-time.Hour)},
+	}
+	env.agent.mu.Unlock()
+	key := "test:k2"
+
+	card := env.engine.handleCardNav("act:/switch 1", key)
+	if card == nil {
+		t.Fatal("expected a refusal card for the foreign row, got nil")
+	}
+	if got := fmt.Sprintf("%+v", card.Elements); !strings.Contains(got, "belongs to") {
+		t.Fatalf("refusal card missing guard message, got %v", got)
+	}
+	if got := env.engine.sessions.GetOrCreateActive(key).GetAgentSessionID(); got != "" {
+		t.Fatalf("foreign card switch bound agent session %q, want none", got)
+	}
+
+	own := env.engine.handleCardNav("act:/switch 2", key)
+	if got := fmt.Sprintf("%+v", own.Elements); strings.Contains(got, "belongs to") {
+		t.Fatalf("own card switch wrongly refused: %v", got)
+	}
+	if got := env.engine.sessions.GetOrCreateActive(key).GetAgentSessionID(); got != "ses_own" {
+		t.Fatalf("own card switch bound %q, want ses_own", got)
+	}
+}
+
+// TestCUJ_K3_SwitchThroughSymlinkedWorkDir pins end-to-end that a project
+// reached through a symlink is still recognized as the current project:
+// /switch into its own session succeeds instead of being refused as foreign.
+func TestCUJ_K3_SwitchThroughSymlinkedWorkDir(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	env := newCUJEnv(t)
+	env.agent.SetWorkDir(link)
+	now := time.Now()
+	env.agent.mu.Lock()
+	env.agent.listSessions = []AgentSessionInfo{
+		{ID: "ses_link", Summary: "linked work", Directory: real, MessageCount: 1, ModifiedAt: now},
+	}
+	env.agent.mu.Unlock()
+
+	env.userSends("k3", "/switch 1")
+	env.waitFor("switch success", 5*time.Second, func() bool { return len(env.plat.getSent()) >= 1 })
+	if got := env.lastSent(); !strings.Contains(got, "Switched to") {
+		t.Fatalf("symlinked workdir switch refused, got %q", got)
+	}
+}
