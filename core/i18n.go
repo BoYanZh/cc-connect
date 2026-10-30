@@ -546,9 +546,9 @@ const (
 	MsgSwitchSuccess   MsgKey = "switch_success"
 	MsgSwitchNoMatch   MsgKey = "switch_no_match"
 	MsgSwitchNoSession MsgKey = "switch_no_session"
-	// MsgSwitchForeignDirectory refuses a switch into a session that lives
+	// MsgForeignSessionDenied refuses an action on a session that lives
 	// in another project directory (global /list can point at one).
-	MsgSwitchForeignDirectory MsgKey = "switch_foreign_directory"
+	MsgForeignSessionDenied MsgKey = "foreign_session_denied"
 
 	MsgCommandTimeout MsgKey = "command_timeout"
 
@@ -3302,12 +3302,12 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "❌ セッション #%d が見つかりません",
 		LangSpanish:            "❌ No hay sesión #%d",
 	},
-	MsgSwitchForeignDirectory: {
-		LangEnglish:            "❌ Refusing to switch: session %s belongs to %s — switch to that project first",
-		LangChinese:            "❌ 拒绝切换：会话 %s 属于 %s，请先切换到那个项目",
-		LangTraditionalChinese: "❌ 拒絕切換：會話 %s 屬於 %s，請先切換到那個項目",
-		LangJapanese:           "❌ 切り替え拒否：セッション %s は %s に属しています。先にそのプロジェクトに切り替えてください",
-		LangSpanish:            "❌ Cambio denegado: la sesión %s pertenece a %s; cambie primero a ese proyecto",
+	MsgForeignSessionDenied: {
+		LangEnglish:            "❌ Session %s belongs to %s — switch to that project first",
+		LangChinese:            "❌ 会话 %s 属于 %s，请先切换到那个项目",
+		LangTraditionalChinese: "❌ 會話 %s 屬於 %s，請先切換到那個項目",
+		LangJapanese:           "❌ セッション %s は %s に属しています。先にそのプロジェクトに切り替えてください",
+		LangSpanish:            "❌ La sesión %s pertenece a %s; cambie primero a ese proyecto",
 	},
 	MsgCommandTimeout: {
 		LangEnglish:            "⏰ Command timed out (60s): `%s`",

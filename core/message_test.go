@@ -418,6 +418,24 @@ func TestSameAgentDir(t *testing.T) {
 	}
 }
 
+// TestSameAgentDir_Symlink pins that a symlinked work dir still matches the
+// recorded directory: both sides are resolved before comparing. Skipped
+// where symlinks cannot be created (e.g. Windows without developer mode).
+func TestSameAgentDir_Symlink(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if !SameAgentDir(link, real) {
+		t.Error("SameAgentDir(link, real) = false, want true")
+	}
+	other := t.TempDir()
+	if SameAgentDir(link, other) {
+		t.Error("SameAgentDir(link, other) = true, want false")
+	}
+}
+
 // TestSessionDirLabel pins the /list foreign-entry marker: same-directory
 // and unknown directories get no label, foreign ones get " (base)".
 func TestSessionDirLabel(t *testing.T) {

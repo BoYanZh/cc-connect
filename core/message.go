@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -540,19 +541,29 @@ type AgentSessionInfo struct {
 }
 
 // SameAgentDir reports whether two session directory spellings refer to the
-// same project directory: slashes are normalized and, on Windows, letter
-// case is ignored.
+// same project directory: slashes are normalized, symlinks are resolved, and,
+// on Windows, letter case is ignored. Unresolvable paths fall back to their
+// cleaned spelling so missing directories still compare sanely.
 func SameAgentDir(a, b string) bool {
-	na := filepath.ToSlash(filepath.Clean(a))
-	nb := filepath.ToSlash(filepath.Clean(b))
+	na := resolveAgentDir(a)
+	nb := resolveAgentDir(b)
 	if runtime.GOOS == "windows" {
 		return strings.EqualFold(na, nb)
 	}
 	return na == nb
 }
 
-// SessionDirLabel returns a short "(name)" suffix for sessions that live
-// outside workDir, or "" when the session belongs to workDir. When the
+// resolveAgentDir normalizes one directory spelling for SameAgentDir.
+func resolveAgentDir(p string) string {
+	cleaned := filepath.ToSlash(filepath.Clean(p))
+	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
+		return filepath.ToSlash(resolved)
+	}
+	return cleaned
+}
+
+// SessionDirLabel returns a short "(parent/base)" suffix for sessions that
+// live outside workDir, or "" when the session belongs to workDir. When the
 // workDir is unknown the label is kept (better labelled than silently
 // ambiguous), except for an empty session directory which is never labelled.
 func SessionDirLabel(dir, workDir string) string {
@@ -562,5 +573,11 @@ func SessionDirLabel(dir, workDir string) string {
 	if workDir != "" && SameAgentDir(dir, workDir) {
 		return ""
 	}
-	return " (" + filepath.Base(filepath.FromSlash(dir)) + ")"
+	slash := strings.TrimSuffix(filepath.ToSlash(dir), "/")
+	base := path.Base(slash)
+	parent := path.Base(path.Dir(slash))
+	if parent == "" || parent == "." || parent == "/" || parent == base || strings.Contains(parent, ":") {
+		return " (" + base + ")"
+	}
+	return " (" + parent + "/" + base + ")"
 }
