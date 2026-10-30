@@ -3,6 +3,7 @@ package opencode
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
+	_ "modernc.org/sqlite"
 )
 
 func init() {
@@ -679,38 +681,47 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 	return sessions, nil
 }
 
-// querySessionMessageCounts uses the sqlite3 CLI to read message counts from
-// the given OpenCode database. Returns an empty map on any failure.
+// querySessionMessageCounts reads per-session message counts from the given
+// OpenCode database using the in-process sqlite driver (no sqlite3 CLI
+// needed). OpenCode v2 records turns in session_message/session_v2 while the
+// v1 message/session tables stop receiving writes, so v2 tables are read
+// first with a v1 fallback for older databases. Returns an empty map on any
+// failure.
 func querySessionMessageCounts(dbPath string) map[string]int {
-	if dbPath == "" {
-		return nil
-	}
-	if _, err := os.Stat(dbPath); err != nil {
-		return nil
-	}
-	sqlite3, err := exec.LookPath("sqlite3")
+	db, err := openOpencodeDB(dbPath)
 	if err != nil {
-		slog.Warn("opencode: sqlite3 CLI not found, message counts unavailable", "err", err)
 		return nil
+	}
+	defer db.Close()
+
+	table := "session_message"
+	if !tableExists(db, table) {
+		table = "message"
+		if !tableExists(db, table) {
+			slog.Debug("opencode: no session message table found, counts unavailable", "db_path", dbPath)
+			return nil
+		}
 	}
 
-	out, err := exec.Command(sqlite3, dbPath,
-		"SELECT session_id, COUNT(*) FROM message GROUP BY session_id").Output()
+	rows, err := db.Query("SELECT session_id, COUNT(*) FROM \"" + table + "\" GROUP BY session_id")
 	if err != nil {
-		slog.Warn("opencode: sqlite3 query failed", "db_path", dbPath, "err", err)
+		slog.Warn("opencode: session count query failed", "db_path", dbPath, "table", table, "err", err)
 		return nil
 	}
+	defer rows.Close()
 
 	counts := make(map[string]int)
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		parts := strings.SplitN(line, "|", 2)
-		if len(parts) != 2 {
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
 			continue
 		}
-		var n int
-		if _, err := fmt.Sscanf(parts[1], "%d", &n); err == nil {
-			counts[parts[0]] = n
-		}
+		counts[id] = n
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("opencode: session count scan failed", "db_path", dbPath, "err", err)
+		return nil
 	}
 	return counts
 }
@@ -718,6 +729,37 @@ func querySessionMessageCounts(dbPath string) map[string]int {
 // legacyOpencodeDBPath is the default OpenCode database location
 // (honoring XDG_DATA_HOME). Counts/titles must be read from the same file
 // the CLI uses; a mismatch surfaces as ghost sessions with 0 msgs in /list.
+
+// openOpencodeDB opens the OpenCode sqlite database read-only. The server may
+// hold the database open for writing; read-only mode plus a short busy
+// timeout keeps lookups from blocking on it.
+func openOpencodeDB(dbPath string) (*sql.DB, error) {
+	if dbPath == "" {
+		return nil, fmt.Errorf("opencode: empty database path")
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dbPath+"?mode=ro")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// tableExists reports whether the named table exists in the opened database.
+func tableExists(db *sql.DB, name string) bool {
+	var found string
+	if err := db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&found); err != nil {
+		return false
+	}
+	return found == name
+}
 func legacyOpencodeDBPath() string {
 	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
 		return filepath.Join(xdg, "opencode", "opencode.db")
@@ -734,22 +776,21 @@ func (a *Agent) GetSessionTitle(sessionID string) string {
 }
 
 func querySessionTitle(dbPath, sessionID string) string {
-	if dbPath == "" {
-		return ""
-	}
-	if _, err := os.Stat(dbPath); err != nil {
-		return ""
-	}
-	sqlite3, err := exec.LookPath("sqlite3")
+	db, err := openOpencodeDB(dbPath)
 	if err != nil {
 		return ""
 	}
-	escaped := strings.ReplaceAll(sessionID, "'", "''")
-	query := fmt.Sprintf("SELECT title FROM session WHERE id = '%s' LIMIT 1", escaped)
-	out, err := exec.Command(sqlite3, dbPath, query).Output()
-	if err != nil {
-		return ""
+	defer db.Close()
+
+	// v2 stores the live title; fall back to the v1 table on older databases.
+	for _, table := range []string{"session_v2", "session"} {
+		if !tableExists(db, table) {
+			continue
+		}
+		var title string
+		if err := db.QueryRow("SELECT title FROM \""+table+"\" WHERE id = ? LIMIT 1", sessionID).Scan(&title); err == nil {
+			return title
+		}
 	}
-	title := strings.TrimSpace(string(out))
-	return title
+	return ""
 }
