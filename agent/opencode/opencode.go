@@ -700,7 +700,7 @@ func listOpencodeSessionsGlobal(dbPath string) ([]core.AgentSessionInfo, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	defer closeQuiet(db, "db", dbPath)
 	if !tableExists(db, "session_v2") {
 		return nil, fmt.Errorf("opencode: session_v2 table not found")
 	}
@@ -709,7 +709,7 @@ func listOpencodeSessionsGlobal(dbPath string) ([]core.AgentSessionInfo, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeQuiet(rows, "rows", dbPath)
 
 	var sessions []core.AgentSessionInfo
 	for rows.Next() {
@@ -752,7 +752,7 @@ func querySessionMessageCounts(dbPath string) map[string]int {
 	if err != nil {
 		return nil
 	}
-	defer db.Close()
+	defer closeQuiet(db, "db", dbPath)
 
 	table := "session_message"
 	if !tableExists(db, table) {
@@ -768,7 +768,7 @@ func querySessionMessageCounts(dbPath string) map[string]int {
 		slog.Warn("opencode: session count query failed", "db_path", dbPath, "table", table, "err", err)
 		return nil
 	}
-	defer rows.Close()
+	defer closeQuiet(rows, "rows", dbPath)
 
 	counts := make(map[string]int)
 	for rows.Next() {
@@ -806,10 +806,18 @@ func openOpencodeDB(dbPath string) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+// closeQuiet closes c, logging unexpected errors at debug level.
+// Read-only lookups must never fail the caller on close.
+func closeQuiet(c io.Closer, what string, dbPath string) {
+	if err := c.Close(); err != nil {
+		slog.Debug("opencode: close failed", "what", what, "db_path", dbPath, "err", err)
+	}
 }
 
 // tableExists reports whether the named table exists in the opened database.
@@ -840,7 +848,7 @@ func querySessionTitle(dbPath, sessionID string) string {
 	if err != nil {
 		return ""
 	}
-	defer db.Close()
+	defer closeQuiet(db, "db", dbPath)
 
 	// v2 stores the live title; fall back to the v1 table on older databases.
 	for _, table := range []string{"session_v2", "session"} {
