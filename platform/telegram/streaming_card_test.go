@@ -208,7 +208,7 @@ func TestStreamingCard_PersistentFailureBacksOff(t *testing.T) {
 
 // TestStreamingCard_FirstPostFailureBacksOff verifies the cooldown also
 // covers the very first post: with SendMessage failing persistently,
-// repeated Updates do not hit the API on every event.
+// repeated updates do not hit the API on every event.
 func TestStreamingCard_FirstPostFailureBacksOff(t *testing.T) {
 	bot := newStubTelegramBot()
 	bot.sendErr = errors.New("Bad Request: chat not found")

@@ -274,6 +274,26 @@ func TestDeleteSession_RefusesWhenDBUnreadable(t *testing.T) {
 	}
 }
 
+// TestDeleteSession_RefusesWhenDBCorrupt pins the fail-closed rule for a
+// present-but-unreadable database: garbage bytes where sqlite is expected
+// must refuse, not fall through to the unscoped CLI.
+func TestDeleteSession_RefusesWhenDBCorrupt(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", xdg)
+	dbPath := filepath.Join(xdg, "opencode", "opencode.db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dbPath, []byte("this is definitely not a sqlite database"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{cmd: "definitely-not-a-real-binary", workDir: t.TempDir()}
+	err := a.DeleteSession(context.Background(), "ses_anything")
+	if err == nil || !strings.Contains(err.Error(), "refuse to delete") {
+		t.Fatalf("DeleteSession = %v, want refusal on corrupt database", err)
+	}
+}
+
 // TestDeleteSession_AllowsOwnDirectory pins that a session in the agent's
 // own directory still deletes through the CLI.
 func TestDeleteSession_AllowsOwnDirectory(t *testing.T) {
