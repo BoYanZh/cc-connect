@@ -261,6 +261,19 @@ func TestDeleteSession_RefusesForeignDirectory(t *testing.T) {
 	}
 }
 
+// TestDeleteSession_RefusesWhenDBUnreadable pins the fail-closed rule: with
+// no local database at all there is nothing the guard can verify, so the
+// delete is refused instead of reaching the unscoped CLI (the binary below
+// does not exist, so reaching it would fail differently).
+func TestDeleteSession_RefusesWhenDBUnreadable(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	a := &Agent{cmd: "definitely-not-a-real-binary", workDir: t.TempDir()}
+	err := a.DeleteSession(context.Background(), "ses_anything")
+	if err == nil || !strings.Contains(err.Error(), "refuse to delete") {
+		t.Fatalf("DeleteSession = %v, want refusal without a database", err)
+	}
+}
+
 // TestDeleteSession_AllowsOwnDirectory pins that a session in the agent's
 // own directory still deletes through the CLI.
 func TestDeleteSession_AllowsOwnDirectory(t *testing.T) {

@@ -532,6 +532,9 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	// the global /list, an index can point at a foreign session, and the
 	// CLI delete takes only a session ID with no directory scoping.
 	dbPath := legacyOpencodeDBPath()
+	if _, err := os.Stat(dbPath); err != nil {
+		return fmt.Errorf("opencode: refuse to delete session %s: cannot open local database (%v)", sessionID, err)
+	}
 	if dir, known := querySessionDirectory(dbPath, sessionID); known {
 		if !core.SameAgentDir(dir, workDir) {
 			return fmt.Errorf("opencode: refuse to delete session %s from another directory (%s); switch to that project first", sessionID, dir)
