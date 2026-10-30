@@ -338,6 +338,24 @@ type DisplayCfg struct {
 	ToolMessages     bool
 	HistoryMaxLen    *int // max runes for /history entries; nil = default, 0 = no truncation
 	HideAgentFooter  bool // strip model/token footer lines emitted as agent text
+	// QuietProgressIntervalSec bounds progressive text flushes in quiet mode
+	// on platforms without in-place preview: at most one flush per interval
+	// per tool boundary, so long tool-heavy turns stay alive without
+	// spamming short turns. 0 = default 60s.
+	QuietProgressIntervalSec int
+}
+
+// defaultQuietProgressIntervalSec bounds progressive text flushes in quiet
+// mode on platforms without in-place preview (see DisplayCfg).
+const defaultQuietProgressIntervalSec = 60
+
+// quietProgressInterval returns the minimum gap between progressive text
+// flushes for this turn.
+func (c DisplayCfg) quietProgressInterval() time.Duration {
+	if c.QuietProgressIntervalSec > 0 {
+		return time.Duration(c.QuietProgressIntervalSec) * time.Second
+	}
+	return defaultQuietProgressIntervalSec * time.Second
 }
 
 // InstantReplyCfg controls the immediate confirmation reply sent when a message
@@ -5417,7 +5435,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	var textParts []string
 	var segmentStart int // index into textParts: text before this has been sent/displayed
-	silentHold := false  // true while accumulated segment text could still resolve to a bare NO_REPLY marker
+	var lastTextMessageID string
+	var lastProgressAt = turnStart
+	silentHold := false // true while accumulated segment text could still resolve to a bare NO_REPLY marker
 	toolCount := 0
 	waitStart := time.Now()
 	firstEventLogged := false
@@ -5803,6 +5823,20 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if e.display.Mode == "quiet" {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
 						textParts = append(textParts, "\n\n")
+					} else if !sp.canPreview() && time.Since(lastProgressAt) >= e.display.quietProgressInterval() {
+						// No in-place preview on this platform: flush the
+						// pending text, but throttled — long tool-heavy turns
+						// show progress instead of going silent until the
+						// end, while short turns keep the legacy single
+						// coalesced message.
+						segment := strings.Join(textParts[segmentStart:], "")
+						if segment != "" {
+							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
+								sendWorkspace(p, replyCtx, chunk)
+							}
+						}
+						segmentStart = len(textParts)
+						lastProgressAt = time.Now()
 					}
 				} else {
 					if sp.canPreview() {
@@ -5947,6 +5981,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			content := event.Content
 			if e.display.HideAgentFooter {
 				content = stripAgentFooterLines(content)
+			}
+			// Separate consecutive assistant messages: the backend emits one
+			// text event per message part, so a new messageID means a new
+			// message. Without a boundary marker distinct messages fuse
+			// into one run-on paragraph downstream (e.g. Telegram shows
+			// "A。B。" on a single line while the web UI shows two bubbles).
+			if msgID := event.MessageID; msgID != "" && lastTextMessageID != "" && msgID != lastTextMessageID {
+				content = "\n\n" + content
+			}
+			if event.MessageID != "" {
+				lastTextMessageID = event.MessageID
 			}
 			if content != "" && !isEllipsisOnly(content) {
 				// Pre-compute silentHold transition including this chunk so the

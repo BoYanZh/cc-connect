@@ -2796,3 +2796,45 @@ type reasoningJourneyPlatform struct {
 func (p *reasoningJourneyPlatform) SetCardNavigationHandler(h CardNavigationHandler) {
 	p.navigation = h
 }
+
+// CUJ-J1 · Quiet mode without preview support (e.g. Telegram): text produced
+// between tool calls must surface progressively, and consecutive assistant
+// messages must stay separated by a blank line. Pre-fix, EventText
+// accumulated silently until end of turn (tool-heavy turns showed nothing
+// for minutes, then arrived all at once) and distinct messages fused into
+// one run-on paragraph ("A。B。" on a single line while the web UI shows
+// two bubbles).
+func TestCUJ_J1_QuietProgressiveTextAndMessageBoundary(t *testing.T) {
+	env := newCUJEnv(t)
+	env.engine.display.Mode = "quiet"
+	env.engine.display.ToolMessages = false
+	// Short interval so the scripted tool boundary (1.1s in) triggers the
+	// progressive flush; production default is 60s (short turns unaffected).
+	env.engine.display.QuietProgressIntervalSec = 1
+	env.agent.setNextSessionEvents([]Event{
+		{Type: EventText, Content: "正在看现在的实时状态。", MessageID: "msg-a"},
+		{Type: EventToolUse, ToolName: "grep", ToolInput: "pattern"},
+		{Type: EventText, Content: "换个方式查库。", MessageID: "msg-b"},
+		{Type: EventResult, Content: "", Done: true},
+	}, 1100)
+	env.userSends("alex", "查一下进度")
+	env.waitFor("interim progress text", 5*time.Second, func() bool {
+		return len(env.plat.getSent()) >= 1
+	})
+	env.waitFor("turn completion", 5*time.Second, func() bool {
+		return len(env.plat.getSent()) >= 2
+	})
+	sent := env.plat.getSent()
+	if !strings.Contains(sent[0], "正在看现在的实时状态") {
+		t.Fatalf("first message should carry the interim progress text, got %q", sent[0])
+	}
+	joined := strings.Join(sent, "")
+	if !strings.Contains(joined, "状态。\n\n换个方式") {
+		t.Fatalf("consecutive assistant messages must stay separated by a blank line, got %q", joined)
+	}
+	for _, s := range sent {
+		if strings.Contains(s, "状态。换个方式") {
+			t.Fatalf("messages fused without separator: %q", s)
+		}
+	}
+}
