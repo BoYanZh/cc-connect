@@ -8009,6 +8009,13 @@ func (e *Engine) guardWorkDir(agent Agent, sessionKey string) string {
 	if wd := e.sendWorkDirForSession(sessionKey); wd != "" {
 		return normalizeWorkspacePath(wd)
 	}
+	// Last resort so the guards stay fail-closed: without a known project
+	// directory a foreign session would otherwise be treated as local.
+	// Agents that always set a work dir (e.g. opencode defaults it to ".")
+	// never reach this branch.
+	if cwd, err := os.Getwd(); err == nil {
+		return normalizeWorkspacePath(cwd)
+	}
 	return ""
 }
 

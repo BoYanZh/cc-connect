@@ -2961,3 +2961,23 @@ func TestCUJ_K3_SwitchThroughSymlinkedWorkDir(t *testing.T) {
 		t.Fatalf("symlinked workdir switch refused, got %q", got)
 	}
 }
+
+// TestCUJ_K4_SwitchRefusesForeignDirectoryWithoutWorkDir pins the
+// fail-closed fallback: when the agent reports no work dir, guardWorkDir
+// falls back to the process working directory instead of treating every
+// session as local.
+func TestCUJ_K4_SwitchRefusesForeignDirectoryWithoutWorkDir(t *testing.T) {
+	env := newCUJEnv(t)
+	now := time.Now()
+	env.agent.mu.Lock()
+	env.agent.listSessions = []AgentSessionInfo{
+		{ID: "ses_foreign", Summary: "foreign work", Directory: "/other", MessageCount: 3, ModifiedAt: now},
+	}
+	env.agent.mu.Unlock()
+
+	env.userSends("k4", "/switch 1")
+	env.waitFor("switch refusal", 5*time.Second, func() bool { return len(env.plat.getSent()) >= 1 })
+	if got := env.lastSent(); !strings.Contains(got, "belongs to") {
+		t.Fatalf("foreign switch without workdir not refused, got %q", got)
+	}
+}
