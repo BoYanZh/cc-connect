@@ -23,6 +23,11 @@ const (
 	// telegramCardMaxText bounds a single edit; Telegram rejects text
 	// messages over 4096 characters.
 	telegramCardMaxText = 4000
+	// telegramCardFailBackoffUnit is the base cooldown after a failed edit;
+	// it grows linearly with consecutive failures (capped below).
+	telegramCardFailBackoffUnit = 5 * time.Second
+	// telegramCardFailBackoffMax caps the edit-failure cooldown.
+	telegramCardFailBackoffMax = 60 * time.Second
 )
 
 // telegramStreamingCard aggregates a whole agent turn into a single Telegram
@@ -42,6 +47,11 @@ type telegramStreamingCard struct {
 	failed     bool
 	lastUpdate time.Time
 	lastSent   string
+	// failCount/coolUntil bound retries against a persistently failing
+	// endpoint: consecutive edit failures back off instead of firing on
+	// every event. Finalize always attempts once regardless.
+	failCount int
+	coolUntil time.Time
 }
 
 // CreateStreamingCard prepares a lazy streaming card; the Telegram message is
@@ -80,27 +90,28 @@ func (c *telegramStreamingCard) sendParams(chunk string, first, html bool) *tgbo
 	return params
 }
 
+// sendChunk sends one chunk, falling back to plain text when Telegram
+// rejects the HTML rendering (a split chunk can cut a tag in half).
+func (c *telegramStreamingCard) sendChunk(ctx context.Context, chunk string, first bool) (*models.Message, error) {
+	sent, err := c.bot.SendMessage(ctx, c.sendParams(chunk, first, true))
+	if err != nil && strings.Contains(err.Error(), "can't parse") {
+		sent, err = c.bot.SendMessage(ctx, c.sendParams(chunk, first, false))
+	}
+	return sent, err
+}
+
 // postFresh posts content as one or more fresh messages, recording the first
 // message ID for subsequent edits. Caller must hold c.mu.
 func (c *telegramStreamingCard) postFresh(ctx context.Context, content string) error {
 	html := core.MarkdownToSimpleHTML(content)
-	chunks, useHTML := core.SplitMessageCodeFenceAware(html, telegramMaxMessageLen), true
-	sent, err := c.bot.SendMessage(ctx, c.sendParams(chunks[0], true, true))
-	if err != nil {
-		if !strings.Contains(err.Error(), "can't parse") {
-			return err
-		}
-		useHTML = false
-		chunks = core.SplitMessageCodeFenceAware(content, telegramMaxMessageLen)
-		sent, err = c.bot.SendMessage(ctx, c.sendParams(chunks[0], true, false))
+	chunks := core.SplitMessageCodeFenceAware(html, telegramMaxMessageLen)
+	for i, chunk := range chunks {
+		sent, err := c.sendChunk(ctx, chunk, i == 0)
 		if err != nil {
 			return err
 		}
-	}
-	c.msgID = sent.ID
-	for _, chunk := range chunks[1:] {
-		if _, err := c.bot.SendMessage(ctx, c.sendParams(chunk, false, useHTML)); err != nil {
-			return err
+		if i == 0 {
+			c.msgID = sent.ID
 		}
 	}
 	return nil
@@ -130,8 +141,10 @@ func (c *telegramStreamingCard) render(ctx context.Context, content string) erro
 }
 
 // Update renders the latest aggregated content. The first post is immediate;
-// subsequent edits are coalesced to telegramCardUpdateMinInterval. Transient
-// errors are swallowed (Finalize retries) so a blip doesn't abort the turn.
+// subsequent edits are coalesced to telegramCardUpdateMinInterval, and
+// consecutive failures back off instead of retrying on every event.
+// Transient errors are swallowed (Finalize retries) so a blip doesn't abort
+// the turn.
 //
 // Once the rendered payload exceeds the edit size limit we stop attempting
 // in-place edits (which would fail); the existing card stays at the last
@@ -142,8 +155,13 @@ func (c *telegramStreamingCard) Update(ctx context.Context, content string) erro
 	if c.failed || content == "" {
 		return nil
 	}
-	if c.msgID != 0 && time.Since(c.lastUpdate) < telegramCardUpdateMinInterval {
-		return nil
+	if c.msgID != 0 {
+		if time.Since(c.lastUpdate) < telegramCardUpdateMinInterval {
+			return nil
+		}
+		if now := time.Now(); now.Before(c.coolUntil) {
+			return nil
+		}
 	}
 	if rendered := core.MarkdownToSimpleHTML(content); rendered == "" || rendered == c.lastSent {
 		return nil
@@ -155,20 +173,30 @@ func (c *telegramStreamingCard) Update(ctx context.Context, content string) erro
 	if err := c.render(ctx, content); err != nil {
 		if isTelegramNotModified(err) {
 			c.lastSent = core.MarkdownToSimpleHTML(content)
+			c.failCount = 0
 			return nil
 		}
-		slog.Debug("telegram: streaming card update failed (will retry on next tick / finalize)", "error", err)
+		c.failCount++
+		backoff := time.Duration(c.failCount) * telegramCardFailBackoffUnit
+		if backoff > telegramCardFailBackoffMax {
+			backoff = telegramCardFailBackoffMax
+		}
+		c.coolUntil = time.Now().Add(backoff)
+		slog.Debug("telegram: streaming card update failed, backing off (will retry on next tick / finalize)",
+			"error", err, "failCount", c.failCount, "cooldown", backoff)
 		return nil
 	}
+	c.failCount = 0
 	c.lastUpdate = time.Now()
 	c.lastSent = core.MarkdownToSimpleHTML(content)
 	return nil
 }
 
-// Finalize writes the final content unconditionally (no throttle); it posts
-// the card if it was never posted. When the final payload exceeds the edit
-// size limit AND a card has already been posted, the full reply is delivered
-// as fresh chunked message(s) — the partial card stays visible above them.
+// Finalize writes the final content unconditionally (no throttle, no
+// backoff); it posts the card if it was never posted. When the final payload
+// exceeds the edit size limit AND a card has already been posted, the stale
+// card is deleted first and the full reply is delivered as fresh chunked
+// message(s) — no frozen snapshot stays behind and no prefix is repeated.
 // The engine sees success, so no fallback duplicate is sent.
 func (c *telegramStreamingCard) Finalize(ctx context.Context, content string) error {
 	c.mu.Lock()
@@ -181,8 +209,12 @@ func (c *telegramStreamingCard) Finalize(ctx context.Context, content string) er
 		return nil
 	}
 	if c.msgID != 0 && len([]rune(rendered)) > telegramCardMaxText {
-		slog.Debug("telegram: streaming card finalize switching to fresh post (payload exceeds edit limit)",
+		slog.Debug("telegram: streaming card finalize replacing stale card with fresh post (payload exceeds edit limit)",
 			"size", len([]rune(rendered)), "limit", telegramCardMaxText)
+		if _, derr := c.bot.DeleteMessage(ctx, &tgbot.DeleteMessageParams{ChatID: c.chatID, MessageID: c.msgID}); derr != nil {
+			slog.Debug("telegram: streaming card delete stale card failed, posting fresh anyway", "error", derr)
+		}
+		c.msgID = 0
 		if err := c.postFresh(ctx, content); err != nil {
 			c.failed = true
 			return fmt.Errorf("telegram: finalize streaming card: %w", err)
@@ -191,6 +223,10 @@ func (c *telegramStreamingCard) Finalize(ctx context.Context, content string) er
 		return nil
 	}
 	if err := c.render(ctx, content); err != nil {
+		if isTelegramNotModified(err) {
+			c.lastSent = rendered
+			return nil
+		}
 		c.failed = true
 		return fmt.Errorf("telegram: finalize streaming card: %w", err)
 	}

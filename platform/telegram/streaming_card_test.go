@@ -113,9 +113,11 @@ func TestStreamingCard_NotModifiedIsSuccess(t *testing.T) {
 	}
 }
 
-// TestStreamingCard_OverflowFinalizePostsFresh verifies that over-limit final
-// content is delivered as fresh message(s) instead of a failing edit.
-func TestStreamingCard_OverflowFinalizePostsFresh(t *testing.T) {
+// TestStreamingCard_OverflowFinalizeDeletesStaleCard verifies the P1-5 fix:
+// when the final payload exceeds the edit limit, the stale snapshot is
+// deleted first and the full reply is posted fresh — the beginning is not
+// delivered twice.
+func TestStreamingCard_OverflowFinalizeDeletesStaleCard(t *testing.T) {
 	bot := newStubTelegramBot()
 	p := newStreamingTestPlatform(bot)
 	sc, err := p.CreateStreamingCard(context.Background(), replyContext{chatID: 1})
@@ -130,11 +132,77 @@ func TestStreamingCard_OverflowFinalizePostsFresh(t *testing.T) {
 	if err := card.Finalize(context.Background(), big); err != nil {
 		t.Fatalf("Finalize: %v", err)
 	}
-	if got := bot.sendMessageCalls; got < 2 {
-		t.Fatalf("sendMessageCalls = %d, want >= 2 (card + fresh final)", got)
+	if got := bot.deleteMessageCalls; got != 1 {
+		t.Fatalf("deleteMessageCalls = %d, want 1 (stale snapshot removed)", got)
+	}
+	// The fresh post must carry the full content exactly once across the new
+	// message(s); the deleted snapshot must not linger as a duplicate.
+	fresh := strings.Join(bot.sentTexts[1:], "")
+	if got := strings.Count(fresh, strings.Repeat("x", 100)); got != (telegramCardMaxText+100)/100 {
+		t.Fatalf("fresh post repeats content %d times, want exactly once", got)
 	}
 	if card.Failed() {
 		t.Fatal("card marked failed after successful overflow finalize")
+	}
+}
+
+// TestStreamingCard_FinalizeNotModifiedIsSuccess verifies Finalize treats
+// "message is not modified" like Update does instead of failing the card
+// (which would make the engine send the answer a second time).
+func TestStreamingCard_FinalizeNotModifiedIsSuccess(t *testing.T) {
+	bot := newStubTelegramBot()
+	p := newStreamingTestPlatform(bot)
+	sc, err := p.CreateStreamingCard(context.Background(), replyContext{chatID: 1})
+	if err != nil {
+		t.Fatalf("CreateStreamingCard: %v", err)
+	}
+	card := sc.(*telegramStreamingCard)
+	if err := card.Update(context.Background(), "v1"); err != nil {
+		t.Fatalf("Update v1: %v", err)
+	}
+	bot.editErr = errors.New("Bad Request: message is not modified")
+	if err := card.Finalize(context.Background(), "v2"); err != nil {
+		t.Fatalf("Finalize with not-modified error: %v", err)
+	}
+	if card.Failed() {
+		t.Fatal("card marked failed on not-modified finalize")
+	}
+}
+
+// TestStreamingCard_PersistentFailureBacksOff verifies consecutive edit
+// failures back off instead of hitting the API on every event.
+func TestStreamingCard_PersistentFailureBacksOff(t *testing.T) {
+	bot := newStubTelegramBot()
+	p := newStreamingTestPlatform(bot)
+	sc, err := p.CreateStreamingCard(context.Background(), replyContext{chatID: 1})
+	if err != nil {
+		t.Fatalf("CreateStreamingCard: %v", err)
+	}
+	card := sc.(*telegramStreamingCard)
+	if err := card.Update(context.Background(), "v1"); err != nil {
+		t.Fatalf("Update v1: %v", err)
+	}
+	bot.editErr = errors.New("Bad Request: bot was blocked by the user")
+	for i := 0; i < 5; i++ {
+		card.lastUpdate = time.Now().Add(-2 * telegramCardUpdateMinInterval)
+		if err := card.Update(context.Background(), "v2"); err != nil {
+			t.Fatalf("Update v2 attempt %d: %v", i, err)
+		}
+	}
+	if got := bot.editMessageTextCalls; got != 1 {
+		t.Fatalf("editMessageTextCalls = %d, want 1 (backed off after first failure)", got)
+	}
+	if card.Failed() {
+		t.Fatal("card marked failed while still retrying with backoff")
+	}
+	// After the cooldown elapses the card tries again instead of staying dead.
+	card.coolUntil = time.Now().Add(-time.Second)
+	card.lastUpdate = time.Now().Add(-2 * telegramCardUpdateMinInterval)
+	if err := card.Update(context.Background(), "v2"); err != nil {
+		t.Fatalf("Update after cooldown: %v", err)
+	}
+	if got := bot.editMessageTextCalls; got != 2 {
+		t.Fatalf("editMessageTextCalls = %d, want 2 (retry after cooldown)", got)
 	}
 }
 
