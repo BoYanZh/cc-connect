@@ -155,13 +155,14 @@ func (c *telegramStreamingCard) Update(ctx context.Context, content string) erro
 	if c.failed || content == "" {
 		return nil
 	}
-	if c.msgID != 0 {
-		if time.Since(c.lastUpdate) < telegramCardUpdateMinInterval {
-			return nil
-		}
-		if now := time.Now(); now.Before(c.coolUntil) {
-			return nil
-		}
+	// The cooldown also covers the first post: without it a persistently
+	// failing endpoint would be retried on every event.
+	now := time.Now()
+	if now.Before(c.coolUntil) {
+		return nil
+	}
+	if c.msgID != 0 && now.Sub(c.lastUpdate) < telegramCardUpdateMinInterval {
+		return nil
 	}
 	if rendered := core.MarkdownToSimpleHTML(content); rendered == "" || rendered == c.lastSent {
 		return nil
@@ -170,6 +171,7 @@ func (c *telegramStreamingCard) Update(ctx context.Context, content string) erro
 			"size", len([]rune(rendered)), "limit", telegramCardMaxText)
 		return nil
 	}
+	c.lastUpdate = now
 	if err := c.render(ctx, content); err != nil {
 		if isTelegramNotModified(err) {
 			c.lastSent = core.MarkdownToSimpleHTML(content)
@@ -187,7 +189,6 @@ func (c *telegramStreamingCard) Update(ctx context.Context, content string) erro
 		return nil
 	}
 	c.failCount = 0
-	c.lastUpdate = time.Now()
 	c.lastSent = core.MarkdownToSimpleHTML(content)
 	return nil
 }

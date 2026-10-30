@@ -206,6 +206,31 @@ func TestStreamingCard_PersistentFailureBacksOff(t *testing.T) {
 	}
 }
 
+// TestStreamingCard_FirstPostFailureBacksOff verifies the cooldown also
+// covers the very first post: with SendMessage failing persistently,
+// repeated Updates do not hit the API on every event.
+func TestStreamingCard_FirstPostFailureBacksOff(t *testing.T) {
+	bot := newStubTelegramBot()
+	bot.sendErr = errors.New("Bad Request: chat not found")
+	p := newStreamingTestPlatform(bot)
+	sc, err := p.CreateStreamingCard(context.Background(), replyContext{chatID: 1})
+	if err != nil {
+		t.Fatalf("CreateStreamingCard: %v", err)
+	}
+	card := sc.(*telegramStreamingCard)
+	for i := 0; i < 5; i++ {
+		if err := card.Update(context.Background(), "v1"); err != nil {
+			t.Fatalf("Update attempt %d: %v", i, err)
+		}
+	}
+	if got := bot.sendMessageCalls; got != 1 {
+		t.Fatalf("sendMessageCalls = %d, want 1 (backed off after first failure)", got)
+	}
+	if card.Failed() {
+		t.Fatal("card marked failed while still retrying with backoff")
+	}
+}
+
 // TestStreamingCard_EmptyContentNoop verifies empty updates never post.
 func TestStreamingCard_EmptyContentNoop(t *testing.T) {
 	bot := newStubTelegramBot()
