@@ -528,6 +528,15 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	workDir := a.workDir
 	a.mu.RUnlock()
 
+	// Never delete a session that lives in another project directory: with
+	// the global /list, an index can point at a foreign session, and the
+	// CLI delete takes only a session ID with no directory scoping. Look
+	// the directory up first; unknown sessions fall through to the CLI so
+	// its own error surfaces.
+	if dir, ok := querySessionDirectory(legacyOpencodeDBPath(), sessionID); ok && !core.SameAgentDir(dir, workDir) {
+		return fmt.Errorf("opencode: refuse to delete session %s from another directory (%s); switch to that project first", sessionID, dir)
+	}
+
 	c := exec.Command(cmd, "session", "delete", sessionID)
 	c.Dir = workDir
 	if out, err := c.CombinedOutput(); err != nil {
@@ -646,20 +655,22 @@ func (a *Agent) providerEnvLocked() []string {
 
 // opencodeSessionEntry represents a session from `opencode session list` output.
 type opencodeSessionEntry struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Updated int64  `json:"updated"` // Unix timestamp in milliseconds
-	Created int64  `json:"created"`
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Directory string `json:"directory"`
+	Updated   int64  `json:"updated"` // Unix timestamp in milliseconds
+	Created   int64  `json:"created"`
 }
 
 func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) {
 	// Global list first: every project, newest first, mirroring the native
 	// OpenCode session picker. Falls back to the server's per-project list
-	// when the v2 tables are unavailable (older databases).
-	if sessions, err := listOpencodeSessionsGlobal(legacyOpencodeDBPath()); err == nil {
+	// when the global list is unavailable or empty (older databases, or a
+	// v2 table that exists but has not been populated yet).
+	if sessions, err := listOpencodeSessionsGlobal(legacyOpencodeDBPath()); err == nil && len(sessions) > 0 {
 		return sessions, nil
 	} else {
-		slog.Debug("opencode: global session list unavailable, falling back to server list", "err", err)
+		slog.Debug("opencode: global session list unavailable or empty, falling back to server list", "err", err)
 	}
 
 	c := exec.Command(cmd, "session", "list", "--format", "json")
@@ -681,6 +692,7 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 	for _, e := range entries {
 		sessions = append(sessions, core.AgentSessionInfo{
 			ID:           e.ID,
+			Directory:    e.Directory,
 			Summary:      e.Title,
 			MessageCount: msgCounts[e.ID],
 			ModifiedAt:   time.UnixMilli(e.Updated),
@@ -691,10 +703,10 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 }
 
 // listOpencodeSessionsGlobal returns sessions from every project, newest
-// first, mirroring the native OpenCode session picker (fork/child sessions
-// included). It reads the v2 tables directly with the in-process driver, so
-// it works the same in server and standalone mode and is not limited to the
-// current work_dir project.
+// first, mirroring the native OpenCode session picker. It reads the v2
+// tables directly with the in-process driver, so it works the same in server
+// and standalone mode and is not limited to the current work_dir project.
+// Child sessions (parent_id set) are excluded, matching `session list`.
 func listOpencodeSessionsGlobal(dbPath string) ([]core.AgentSessionInfo, error) {
 	db, err := openOpencodeDB(dbPath)
 	if err != nil {
@@ -705,7 +717,7 @@ func listOpencodeSessionsGlobal(dbPath string) ([]core.AgentSessionInfo, error) 
 		return nil, fmt.Errorf("opencode: session_v2 table not found")
 	}
 
-	rows, err := db.Query(`SELECT s.id, s.title, COALESCE(s.time_updated, s.time_created, 0) FROM session_v2 s ORDER BY 3 DESC`)
+	rows, err := db.Query(`SELECT s.id, s.title, s.directory, COALESCE(s.time_updated, s.time_created, 0) FROM session_v2 s WHERE s.parent_id IS NULL ORDER BY 4 DESC, s.id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -714,13 +726,14 @@ func listOpencodeSessionsGlobal(dbPath string) ([]core.AgentSessionInfo, error) 
 	var sessions []core.AgentSessionInfo
 	for rows.Next() {
 		var id string
-		var title sql.NullString
+		var title, directory sql.NullString
 		var updated int64
-		if err := rows.Scan(&id, &title, &updated); err != nil {
+		if err := rows.Scan(&id, &title, &directory, &updated); err != nil {
 			continue
 		}
 		sessions = append(sessions, core.AgentSessionInfo{
 			ID:         id,
+			Directory:  directory.String,
 			Summary:    title.String,
 			ModifiedAt: time.UnixMilli(updated),
 		})
@@ -744,9 +757,10 @@ func listOpencodeSessionsGlobal(dbPath string) ([]core.AgentSessionInfo, error) 
 // querySessionMessageCounts reads per-session message counts from the given
 // OpenCode database using the in-process sqlite driver (no sqlite3 CLI
 // needed). OpenCode v2 records turns in session_message/session_v2 while the
-// v1 message/session tables stop receiving writes, so v2 tables are read
-// first with a v1 fallback for older databases. Returns an empty map on any
-// failure.
+// v1 message/session tables stop receiving writes, so the v2 table is read
+// with the v1 table as a base: sessions the migration has not copied yet
+// keep their v1 counts instead of regressing to 0. Returns an empty map on
+// any failure.
 func querySessionMessageCounts(dbPath string) map[string]int {
 	db, err := openOpencodeDB(dbPath)
 	if err != nil {
@@ -754,13 +768,22 @@ func querySessionMessageCounts(dbPath string) map[string]int {
 	}
 	defer closeQuiet(db, "db", dbPath)
 
-	table := "session_message"
-	if !tableExists(db, table) {
-		table = "message"
-		if !tableExists(db, table) {
-			slog.Debug("opencode: no session message table found, counts unavailable", "db_path", dbPath)
-			return nil
+	counts := countBySessionTable(db, dbPath, "message")
+	for id, n := range countBySessionTable(db, dbPath, "session_message") {
+		if counts == nil {
+			counts = make(map[string]int)
 		}
+		counts[id] = n
+	}
+	return counts
+}
+
+// countBySessionTable returns per-session row counts for one message table,
+// or nil when the table does not exist or cannot be read.
+func countBySessionTable(db *sql.DB, dbPath, table string) map[string]int {
+	if !tableExists(db, table) {
+		slog.Debug("opencode: session message table not found, skipping", "db_path", dbPath, "table", table)
+		return nil
 	}
 
 	rows, err := db.Query("SELECT session_id, COUNT(*) FROM \"" + table + "\" GROUP BY session_id")
@@ -780,19 +803,31 @@ func querySessionMessageCounts(dbPath string) map[string]int {
 		counts[id] = n
 	}
 	if err := rows.Err(); err != nil {
-		slog.Warn("opencode: session count scan failed", "db_path", dbPath, "err", err)
+		slog.Warn("opencode: session count scan failed", "db_path", dbPath, "table", table, "err", err)
 		return nil
 	}
 	return counts
 }
 
-// legacyOpencodeDBPath is the default OpenCode database location
-// (honoring XDG_DATA_HOME). Counts/titles must be read from the same file
-// the CLI uses; a mismatch surfaces as ghost sessions with 0 msgs in /list.
+// opencodeDataDir is the directory holding the OpenCode sqlite database.
+func opencodeDataDir() string {
+	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+		return filepath.Join(xdg, "opencode")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "share", "opencode")
+}
 
 // openOpencodeDB opens the OpenCode sqlite database read-only. The server may
 // hold the database open for writing; read-only mode plus a short busy
 // timeout keeps lookups from blocking on it.
+//
+// The DSN uses the file: URI form so the driver's URI parser applies
+// SQLITE_OPEN_READONLY; without it modernc.org/sqlite opens read-write and
+// cc-connect could create -wal/-shm sidecars next to the user's database.
 func openOpencodeDB(dbPath string) (*sql.DB, error) {
 	if dbPath == "" {
 		return nil, fmt.Errorf("opencode: empty database path")
@@ -800,7 +835,7 @@ func openOpencodeDB(dbPath string) (*sql.DB, error) {
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", dbPath+"?mode=ro")
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
 	if err != nil {
 		return nil, err
 	}
@@ -828,15 +863,25 @@ func tableExists(db *sql.DB, name string) bool {
 	}
 	return found == name
 }
+
+// legacyOpencodeDBPath is the default OpenCode database location: the
+// OPENCODE_DB override when set, otherwise opencode.db under the data dir
+// (honoring XDG_DATA_HOME). Counts/titles must be read from the same file
+// the CLI uses; a mismatch surfaces as ghost sessions with 0 msgs in /list.
 func legacyOpencodeDBPath() string {
-	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
-		return filepath.Join(xdg, "opencode", "opencode.db")
+	if v := strings.TrimSpace(os.Getenv("OPENCODE_DB")); v != "" {
+		if filepath.IsAbs(v) {
+			return v
+		}
+		if dir := opencodeDataDir(); dir != "" {
+			return filepath.Join(dir, v)
+		}
+		return v
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
+	if dir := opencodeDataDir(); dir != "" {
+		return filepath.Join(dir, "opencode.db")
 	}
-	return filepath.Join(home, ".local", "share", "opencode", "opencode.db")
+	return ""
 }
 
 func (a *Agent) GetSessionTitle(sessionID string) string {
@@ -861,4 +906,26 @@ func querySessionTitle(dbPath, sessionID string) string {
 		}
 	}
 	return ""
+}
+
+// querySessionDirectory returns the project directory recorded for a
+// session, or false when the database or session is unknown. v2 first,
+// v1 as fallback.
+func querySessionDirectory(dbPath, sessionID string) (string, bool) {
+	db, err := openOpencodeDB(dbPath)
+	if err != nil {
+		return "", false
+	}
+	defer closeQuiet(db, "db", dbPath)
+
+	for _, table := range []string{"session_v2", "session"} {
+		if !tableExists(db, table) {
+			continue
+		}
+		var dir sql.NullString
+		if err := db.QueryRow("SELECT directory FROM \""+table+"\" WHERE id = ? LIMIT 1", sessionID).Scan(&dir); err == nil && dir.String != "" {
+			return dir.String, true
+		}
+	}
+	return "", false
 }

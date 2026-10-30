@@ -48,7 +48,7 @@ const (
 	testV1MessageSchema = `CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)`
 	testV1SessionSchema = `CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT)`
 	testV2MessageSchema = `CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)`
-	testV2SessionSchema = `CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT)`
+	testV2SessionSchema = `CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, directory TEXT, parent_id TEXT, time_created INTEGER, time_updated INTEGER)`
 )
 
 // createTestDB builds a temp sqlite database with the given schema and seed
