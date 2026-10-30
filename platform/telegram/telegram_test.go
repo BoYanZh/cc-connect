@@ -84,6 +84,7 @@ type stubTelegramBot struct {
 	setReactionCalls     int
 
 	sendErr    error
+	editErr    error
 	getFileErr error
 	file       *models.File
 }
@@ -158,6 +159,9 @@ func (b *stubTelegramBot) EditMessageText(_ context.Context, _ *tgbot.EditMessag
 	b.mu.Lock()
 	b.editMessageTextCalls++
 	b.mu.Unlock()
+	if b.editErr != nil {
+		return nil, b.editErr
+	}
 	if b.sendErr != nil {
 		return nil, b.sendErr
 	}
