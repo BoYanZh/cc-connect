@@ -653,6 +653,15 @@ type opencodeSessionEntry struct {
 }
 
 func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) {
+	// Global list first: every project, newest first, mirroring the native
+	// OpenCode session picker. Falls back to the server's per-project list
+	// when the v2 tables are unavailable (older databases).
+	if sessions, err := listOpencodeSessionsGlobal(legacyOpencodeDBPath()); err == nil {
+		return sessions, nil
+	} else {
+		slog.Debug("opencode: global session list unavailable, falling back to server list", "err", err)
+	}
+
 	c := exec.Command(cmd, "session", "list", "--format", "json")
 	c.Dir = workDir
 
@@ -678,6 +687,57 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 		})
 	}
 
+	return sessions, nil
+}
+
+// listOpencodeSessionsGlobal returns sessions from every project, newest
+// first, mirroring the native OpenCode session picker (fork/child sessions
+// included). It reads the v2 tables directly with the in-process driver, so
+// it works the same in server and standalone mode and is not limited to the
+// current work_dir project.
+func listOpencodeSessionsGlobal(dbPath string) ([]core.AgentSessionInfo, error) {
+	db, err := openOpencodeDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	if !tableExists(db, "session_v2") {
+		return nil, fmt.Errorf("opencode: session_v2 table not found")
+	}
+
+	rows, err := db.Query(`SELECT s.id, s.title, COALESCE(s.time_updated, s.time_created, 0) FROM session_v2 s ORDER BY 3 DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []core.AgentSessionInfo
+	for rows.Next() {
+		var id string
+		var title sql.NullString
+		var updated int64
+		if err := rows.Scan(&id, &title, &updated); err != nil {
+			continue
+		}
+		sessions = append(sessions, core.AgentSessionInfo{
+			ID:         id,
+			Summary:    title.String,
+			ModifiedAt: time.UnixMilli(updated),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	byID := make(map[string]int, len(sessions))
+	for i := range sessions {
+		byID[sessions[i].ID] = i
+	}
+	for id, n := range querySessionMessageCounts(dbPath) {
+		if i, ok := byID[id]; ok {
+			sessions[i].MessageCount = n
+		}
+	}
 	return sessions, nil
 }
 
