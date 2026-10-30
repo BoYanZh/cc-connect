@@ -60,7 +60,11 @@ func createTestDB(t *testing.T, schemas []string, seeds []string) string {
 	if err != nil {
 		t.Fatalf("open test db: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close test db: %v", err)
+		}
+	}()
 	for _, s := range schemas {
 		if _, err := db.Exec(s); err != nil {
 			t.Fatalf("create schema %q: %v", s, err)
