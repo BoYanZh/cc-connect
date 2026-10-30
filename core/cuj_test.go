@@ -173,6 +173,12 @@ type cujAgent struct {
 	// setNextSessionEvents on cujAgent.
 	nextSessionEvents  []Event
 	nextSessionDelayMs int
+
+	// listSessions, when non-nil, is returned by ListSessions so command
+	// tests (/list, /switch) can drive a scripted session list.
+	listSessions []AgentSessionInfo
+	// workDir scopes cross-project guards (see WorkDirSwitcher).
+	workDir string
 }
 
 func (a *cujAgent) Name() string { return "cuj" }
@@ -199,8 +205,25 @@ func (a *cujAgent) StartSession(_ context.Context, _ string) (AgentSession, erro
 }
 
 func (a *cujAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) {
-	return nil, nil
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]AgentSessionInfo(nil), a.listSessions...), nil
 }
+
+// SetWorkDir/GetWorkDir implement core.WorkDirSwitcher so cross-project
+// guard tests can scope the stub agent to a directory.
+func (a *cujAgent) SetWorkDir(dir string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.workDir = dir
+}
+
+func (a *cujAgent) GetWorkDir() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.workDir
+}
+
 func (a *cujAgent) Stop() error { return nil }
 
 // cujAgentSession is an AgentSession whose reply is controllable per-Send.
@@ -2797,13 +2820,14 @@ func (p *reasoningJourneyPlatform) SetCardNavigationHandler(h CardNavigationHand
 	p.navigation = h
 }
 
-// CUJ-J1 · Quiet mode without preview support (e.g. Telegram): text produced
-// between tool calls must surface progressively, and consecutive assistant
-// messages must stay separated by a blank line. Pre-fix, EventText
+// CUJ-J1 · Quiet mode on a platform without in-place preview support: text
+// produced between tool calls must surface progressively, and consecutive
+// assistant messages must stay separated by a blank line. Pre-fix, EventText
 // accumulated silently until end of turn (tool-heavy turns showed nothing
 // for minutes, then arrived all at once) and distinct messages fused into
 // one run-on paragraph ("A。B。" on a single line while the web UI shows
-// two bubbles).
+// two bubbles). The stub platform has no MessageUpdater, exercising the
+// fallback path (platforms with one update the preview in place instead).
 func TestCUJ_J1_QuietProgressiveTextAndMessageBoundary(t *testing.T) {
 	env := newCUJEnv(t)
 	env.engine.display.Mode = "quiet"
@@ -2836,5 +2860,43 @@ func TestCUJ_J1_QuietProgressiveTextAndMessageBoundary(t *testing.T) {
 		if strings.Contains(s, "状态。换个方式") {
 			t.Fatalf("messages fused without separator: %q", s)
 		}
+	}
+}
+
+// CUJ-K1 · Cross-project guard: with a global /list, /switch into a session
+// from another directory is refused, while /switch into an own-directory
+// session succeeds. Foreign entries are labelled with their directory.
+func TestCUJ_K1_SwitchRefusesForeignDirectory(t *testing.T) {
+	env := newCUJEnv(t)
+	env.agent.SetWorkDir("/work")
+	now := time.Now()
+	env.agent.mu.Lock()
+	env.agent.listSessions = []AgentSessionInfo{
+		{ID: "ses_foreign", Summary: "foreign work", Directory: "/other", MessageCount: 3, ModifiedAt: now},
+		{ID: "ses_own", Summary: "own work", Directory: "/work", MessageCount: 5, ModifiedAt: now.Add(-time.Hour)},
+	}
+	env.agent.mu.Unlock()
+
+	// 1. /list shows both entries; the foreign one is labelled.
+	env.userSends("k1", "/list")
+	env.waitFor("list reply", 5*time.Second, func() bool { return len(env.plat.getSent()) >= 1 })
+	if joined := strings.Join(env.plat.getSent(), "\n"); !strings.Contains(joined, "(other)") {
+		t.Fatalf("foreign session not labelled with its directory, got %q", joined)
+	}
+
+	// 2. /switch 1 targets the foreign session and must be refused.
+	env.plat.clearSent()
+	env.userSends("k1", "/switch 1")
+	env.waitFor("switch refusal", 5*time.Second, func() bool { return len(env.plat.getSent()) >= 1 })
+	if got := env.lastSent(); !strings.Contains(got, "belongs to") {
+		t.Fatalf("foreign switch not refused, got %q", got)
+	}
+
+	// 3. /switch 2 targets the own-directory session and succeeds.
+	env.plat.clearSent()
+	env.userSends("k1", "/switch 2")
+	env.waitFor("switch success", 5*time.Second, func() bool { return len(env.plat.getSent()) >= 1 })
+	if got := env.lastSent(); !strings.Contains(got, "Switched to") {
+		t.Fatalf("own switch failed, got %q", got)
 	}
 }

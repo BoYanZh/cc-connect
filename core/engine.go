@@ -7800,6 +7800,7 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 		agentName := agent.Name()
 		activeSession := sessions.GetOrCreateActive(msg.SessionKey)
 		activeAgentID := activeSession.GetAgentSessionID()
+		workDir := e.commandWorkDir(agent, msg)
 
 		var sb strings.Builder
 		if totalPages > 1 {
@@ -7826,6 +7827,7 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 					displayName = string([]rune(displayName)[:40]) + "…"
 				}
 			}
+			displayName += SessionDirLabel(s.Directory, workDir)
 			sb.WriteString(fmt.Sprintf("%s **%d.** %s · **%d** msgs · %s\n",
 				marker, i+1, displayName, s.MessageCount, s.ModifiedAt.Format("01-02 15:04")))
 		}
@@ -7874,6 +7876,19 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	matched := e.matchSession(agentSessions, sessions, query)
 	if matched == nil {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), query))
+		return
+	}
+
+	// The global list can point at a session from another project. Switching
+	// into it would make the agent read and edit files in that directory
+	// while the UI still shows the current one, so refuse with a pointer
+	// instead of silently crossing the project boundary.
+	if workDir := e.commandWorkDir(agent, msg); matched.Directory != "" && workDir != "" && !SameAgentDir(matched.Directory, workDir) {
+		shortID := matched.ID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgSwitchForeignDirectory, shortID, matched.Directory))
 		return
 	}
 
@@ -13996,6 +14011,10 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 	agentName := agent.Name()
 	activeSession := sessions.GetOrCreateActive(sessionKey)
 	activeAgentID := activeSession.GetAgentSessionID()
+	var workDir string
+	if switcher, ok := agent.(WorkDirSwitcher); ok {
+		workDir = switcher.GetWorkDir()
+	}
 
 	var titleStr string
 	if totalPages > 1 {
@@ -14024,6 +14043,7 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 				displayName = string([]rune(displayName)[:40]) + "…"
 			}
 		}
+		displayName += SessionDirLabel(s.Directory, workDir)
 		btnType := "default"
 		if s.ID == activeAgentID {
 			btnType = "primary"
