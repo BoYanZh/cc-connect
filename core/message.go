@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -533,4 +534,33 @@ type AgentSessionInfo struct {
 	MessageCount int
 	ModifiedAt   time.Time
 	GitBranch    string
+	// Directory is the project directory the session belongs to, in the
+	// backend's own spelling. Empty when the agent does not report one.
+	Directory string
+}
+
+// SameAgentDir reports whether two session directory spellings refer to the
+// same project directory: slashes are normalized and, on Windows, letter
+// case is ignored.
+func SameAgentDir(a, b string) bool {
+	na := filepath.ToSlash(filepath.Clean(a))
+	nb := filepath.ToSlash(filepath.Clean(b))
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(na, nb)
+	}
+	return na == nb
+}
+
+// SessionDirLabel returns a short "(name)" suffix for sessions that live
+// outside workDir, or "" when the session belongs to workDir. When the
+// workDir is unknown the label is kept (better labelled than silently
+// ambiguous), except for an empty session directory which is never labelled.
+func SessionDirLabel(dir, workDir string) string {
+	if dir == "" {
+		return ""
+	}
+	if workDir != "" && SameAgentDir(dir, workDir) {
+		return ""
+	}
+	return " (" + filepath.Base(filepath.FromSlash(dir)) + ")"
 }
